@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+Test the emergency fixes for Supabase API key issues locally.
+"""
+import asyncio
+import logging
+from database import get_database
+from repositories.user_repository import UserRepository
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def test_emergency_fixes():
+    """Test that the emergency fixes handle service key failures gracefully."""
+    print("🔧 TESTING EMERGENCY API KEY FIXES")
+    print("=" * 50)
+    
+    # Test user ID
+    test_user_id = "123e4567-e89b-12d3-a456-426614174000"
+    mock_auth_token = "supabase_token_12345"  # Mock token to simulate authenticated user
+    
+    try:
+        # Initialize database
+        db = await get_database()
+        user_repo = UserRepository(db)
+        
+        print(f"\n1. Testing enhanced database fallback mechanism...")
+        try:
+            # This should now fall back to anon key gracefully
+            result = db.execute_query(
+                table="users",
+                operation="select",
+                filters={"id": test_user_id},
+                use_service_key=True,  # This will trigger fallback
+                auth_token=mock_auth_token,
+                user_id=test_user_id,
+                single=False
+            )
+            print(f"✅ Database fallback mechanism working: {len(result) if result else 0} records")
+        except Exception as e:
+            print(f"⚠️ Database fallback test result: {e}")
+            print(f"   (This is expected if user doesn't exist)")
+        
+        print(f"\n2. Testing enhanced credit operations with auth token...")
+        try:
+            # Test with auth token - should work with anon key + RLS
+            credits = await user_repo.get_user_credits(test_user_id, auth_token=mock_auth_token)
+            print(f"✅ Credit query with auth token successful: {credits} credits")
+        except Exception as e:
+            print(f"⚠️ Credit query with auth token: {e}")
+            # Check if it's the expected "user not found" error vs API key error
+            if "Invalid API key" in str(e):
+                print(f"❌ Still getting API key errors - fix incomplete")
+            else:
+                print(f"✅ No more API key errors - fix working (user creation needed)")
+        
+        print(f"\n3. Testing service key fallback detection...")
+        try:
+            # Direct service client test
+            service_client = db.service_client
+            test_result = service_client.table("users").select("id").limit(1).execute()
+            print(f"❌ Service key unexpectedly working - may have been fixed externally")
+        except Exception as e:
+            if "Invalid API key" in str(e):
+                print(f"✅ Service key failure correctly detected: {str(e)[:100]}...")
+            else:
+                print(f"⚠️ Service key different error: {e}")
+        
+        print(f"\n4. Testing anon key functionality...")
+        try:
+            # Test anon client directly
+            anon_client = db.client
+            test_result = anon_client.table("users").select("id").limit(1).execute()
+            print(f"✅ Anon key working correctly: {len(test_result.data) if test_result.data else 0} records")
+        except Exception as e:
+            print(f"❌ Anon key also failing: {e}")
+        
+    except Exception as e:
+        print(f"💥 CRITICAL ERROR in test setup: {e}")
+    
+    print(f"\n" + "=" * 50)
+    print(f"EMERGENCY FIX TEST COMPLETE")
+    print(f"=" * 50)
+    print(f"\n📋 NEXT STEPS:")
+    print(f"1. If service key errors persist, update Railway environment variables")
+    print(f"2. Ensure proper RLS policies are in place for anon key operations") 
+    print(f"3. Test with real user authentication tokens")
+    print(f"4. Monitor credit operations in production")
+
+if __name__ == "__main__":
+    asyncio.run(test_emergency_fixes())

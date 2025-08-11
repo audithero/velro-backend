@@ -1,0 +1,304 @@
+# Velro Load Testing Scenarios Configuration
+# Comprehensive test scenarios for validating 10,000+ user capacity
+
+# PRD Requirements (from docs/PRD.MD lines 369-373)
+prd_requirements:
+  concurrent_users: 10000  # 10,000+ simultaneous users
+  database_connections: 200  # 200+ optimized connections
+  cache_hit_rate: 95.0  # 95%+ for authorization operations
+  throughput_rps: 1000.0  # 1,000+ requests/second sustained
+  response_times:
+    authentication_ms: 50  # <50ms authentication
+    authorization_ms: 75  # <75ms authorization
+    generation_access_ms: 100  # <100ms generation access
+    media_url_ms: 200  # <200ms media URL generation
+
+# Test Environment Configuration
+test_environment:
+  base_url: "${VELRO_API_URL:-https://velro-backend-production.up.railway.app}"
+  service_key: "${SUPABASE_SERVICE_KEY}"
+  redis_url: "${REDIS_URL:-redis://localhost:6379}"
+  
+  # Connection pooling
+  max_connections: 1000
+  max_connections_per_host: 100
+  connection_timeout_seconds: 10
+  request_timeout_seconds: 30
+  
+  # Test data generation
+  test_users_count: 100  # Number of test users to create
+  test_generations_count: 500  # Number of test generations
+  hot_data_percentage: 0.2  # 20% of data gets 80% of requests
+
+# Load Test Scenarios
+scenarios:
+  # Phase 1: Warm-up and baseline establishment
+  warm_up_baseline:
+    name: "warm_up_baseline_500_users"
+    description: "Establish baseline performance with 500 users"
+    concurrent_users: 500
+    test_duration_seconds: 120  # 2 minutes
+    ramp_up_time_seconds: 30
+    targets:
+      requests_per_second: 100.0
+      p95_response_time_ms: 75.0
+      cache_hit_rate: 85.0
+      error_rate_max: 0.01  # 1%
+    
+    # Request mix patterns
+    request_patterns:
+      authentication_check: 0.9  # 90% of requests check auth
+      authorization_check: 0.8   # 80% check authorization
+      generation_list: 0.6       # 60% list generations
+      model_access: 0.3          # 30% access models
+      generation_create: 0.1     # 10% create generations
+      media_url_access: 0.2      # 20% access media URLs
+
+  # Phase 2: Intermediate scaling validation
+  intermediate_scaling:
+    name: "intermediate_scaling_2500_users"
+    description: "Test system stability at 2500 concurrent users"
+    concurrent_users: 2500
+    test_duration_seconds: 300  # 5 minutes
+    ramp_up_time_seconds: 60
+    targets:
+      requests_per_second: 500.0
+      p95_response_time_ms: 75.0
+      cache_hit_rate: 90.0
+      error_rate_max: 0.02  # 2%
+    
+    request_patterns:
+      authentication_check: 0.95
+      authorization_check: 0.85
+      generation_list: 0.7
+      model_access: 0.4
+      generation_create: 0.15
+      media_url_access: 0.25
+    
+    # Advanced testing features
+    advanced_features:
+      circuit_breaker_testing: true
+      cache_invalidation_simulation: true
+      database_failover_testing: false
+      redis_failover_testing: false
+
+  # Phase 3: Large scale validation
+  large_scale_validation:
+    name: "large_scale_validation_5000_users"
+    description: "Validate performance at 5000 users before PRD test"
+    concurrent_users: 5000
+    test_duration_seconds: 450  # 7.5 minutes
+    ramp_up_time_seconds: 90
+    targets:
+      requests_per_second: 800.0
+      p95_response_time_ms: 75.0
+      cache_hit_rate: 93.0
+      error_rate_max: 0.03  # 3%
+    
+    request_patterns:
+      authentication_check: 1.0  # All requests authenticated
+      authorization_check: 0.9
+      generation_list: 0.8
+      model_access: 0.5
+      generation_create: 0.2
+      media_url_access: 0.3
+    
+    advanced_features:
+      circuit_breaker_testing: true
+      cache_invalidation_simulation: true
+      database_connection_monitoring: true
+      memory_usage_monitoring: true
+      cache_performance_detailed: true
+
+  # Phase 4: PRD Compliance Validation (Main Test)
+  prd_compliance_validation:
+    name: "prd_compliance_10000_users"
+    description: "Official PRD compliance test with 10,000+ users"
+    concurrent_users: 10000
+    test_duration_seconds: 600  # 10 minutes sustained load
+    ramp_up_time_seconds: 120   # 2 minute ramp-up
+    targets:
+      requests_per_second: 1000.0  # PRD requirement
+      p95_response_time_ms: 75.0   # Authorization target
+      p50_authentication_ms: 40.0  # Below 50ms target
+      p95_authentication_ms: 50.0  # PRD authentication target
+      cache_hit_rate: 95.0         # PRD cache requirement
+      error_rate_max: 0.01         # 1% max error rate
+    
+    request_patterns:
+      authentication_check: 1.0
+      authorization_check: 0.95
+      generation_list: 0.85
+      model_access: 0.6
+      generation_create: 0.25
+      media_url_access: 0.4
+    
+    advanced_features:
+      circuit_breaker_testing: true
+      cache_invalidation_simulation: true
+      database_connection_monitoring: true
+      redis_connection_monitoring: true
+      memory_usage_monitoring: true
+      cpu_usage_monitoring: true
+      cache_performance_detailed: true
+      real_time_metrics_collection: true
+    
+    # PRD-specific validation
+    prd_validation:
+      validate_concurrent_users: true
+      validate_database_connections: true
+      validate_cache_hit_rate: true
+      validate_throughput: true
+      validate_response_times: true
+      generate_compliance_report: true
+
+  # Phase 5: Stress testing beyond PRD
+  stress_test_beyond_prd:
+    name: "stress_test_15000_users"
+    description: "Stress test beyond PRD requirements to find limits"
+    concurrent_users: 15000
+    test_duration_seconds: 300  # 5 minutes
+    ramp_up_time_seconds: 90
+    targets:
+      requests_per_second: 1200.0
+      p95_response_time_ms: 100.0  # Relaxed for stress test
+      cache_hit_rate: 90.0         # Relaxed for stress test
+      error_rate_max: 0.05         # 5% max error rate
+    
+    request_patterns:
+      authentication_check: 1.0
+      authorization_check: 0.9
+      generation_list: 0.8
+      model_access: 0.4
+      generation_create: 0.15
+      media_url_access: 0.3
+    
+    advanced_features:
+      circuit_breaker_testing: true
+      graceful_degradation_testing: true
+      system_limit_discovery: true
+      failure_recovery_testing: true
+
+  # Phase 6: Endurance testing
+  endurance_test:
+    name: "endurance_test_8000_users"
+    description: "Long-running endurance test at 80% of PRD capacity"
+    concurrent_users: 8000
+    test_duration_seconds: 1800  # 30 minutes
+    ramp_up_time_seconds: 180    # 3 minutes
+    targets:
+      requests_per_second: 800.0
+      p95_response_time_ms: 75.0
+      cache_hit_rate: 93.0
+      error_rate_max: 0.02
+    
+    request_patterns:
+      authentication_check: 1.0
+      authorization_check: 0.9
+      generation_list: 0.75
+      model_access: 0.45
+      generation_create: 0.2
+      media_url_access: 0.3
+    
+    advanced_features:
+      memory_leak_detection: true
+      connection_leak_detection: true
+      cache_performance_degradation_monitoring: true
+      long_term_stability_validation: true
+
+# Monitoring and Alerting Configuration
+monitoring:
+  system_metrics:
+    cpu_usage_threshold: 80.0
+    memory_usage_threshold: 85.0
+    connection_count_threshold: 950
+    disk_usage_threshold: 90.0
+  
+  application_metrics:
+    response_time_p95_threshold_ms: 100.0
+    error_rate_threshold: 0.05
+    cache_hit_rate_threshold: 90.0
+    throughput_threshold_rps: 800.0
+  
+  database_metrics:
+    connection_pool_usage_threshold: 85.0
+    query_execution_time_threshold_ms: 200.0
+    connection_wait_time_threshold_ms: 50.0
+  
+  cache_metrics:
+    redis_memory_usage_threshold: 80.0
+    cache_eviction_rate_threshold: 0.1
+    cache_miss_rate_threshold: 0.15
+
+# Reporting Configuration
+reporting:
+  output_formats:
+    - json
+    - html
+    - csv
+  
+  metrics_to_include:
+    - response_time_percentiles
+    - throughput_over_time
+    - error_rate_analysis
+    - cache_performance_breakdown
+    - system_resource_utilization
+    - database_performance_metrics
+    - prd_compliance_assessment
+  
+  automated_analysis:
+    performance_regression_detection: true
+    bottleneck_identification: true
+    capacity_planning_recommendations: true
+    optimization_suggestions: true
+  
+  report_distribution:
+    save_local: true
+    generate_summary: true
+    create_executive_summary: true
+
+# Test Data Management
+test_data:
+  cleanup_after_test: true
+  preserve_performance_data: true
+  
+  user_data:
+    email_pattern: "loadtest_{index}_{timestamp}@velro.ai"
+    password_pattern: "LoadTest123!{index}"
+    name_pattern: "Load Test User {index}"
+  
+  generation_data:
+    prompt_patterns:
+      - "Load test image generation {index}"
+      - "Performance test artwork {index}"
+      - "Concurrent user test {index}"
+      - "Scale validation image {index}"
+    
+    models_to_test:
+      - "fal-ai/flux"
+      - "fal-ai/stable-diffusion"
+    
+    image_dimensions:
+      - [512, 512]
+      - [768, 768]
+      - [1024, 1024]
+
+# Safety and Limits
+safety_limits:
+  max_concurrent_users: 20000  # Hard limit
+  max_test_duration_seconds: 3600  # 1 hour
+  max_requests_per_second: 2000
+  
+  circuit_breaker:
+    error_rate_threshold: 0.1  # 10%
+    response_time_threshold_ms: 5000
+    min_requests_for_evaluation: 50
+  
+  rate_limiting:
+    requests_per_minute_per_user: 120
+    burst_allowance: 20
+  
+  resource_limits:
+    max_memory_usage_mb: 8192
+    max_cpu_usage_percent: 95.0
+    max_disk_usage_percent: 95.0

@@ -1,0 +1,249 @@
+# Alertmanager Configuration for UUID Authorization System
+# Production-ready alerting with intelligent routing and escalation
+
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alerts@velro.com'
+  smtp_auth_username: 'alerts@velro.com'
+  smtp_auth_password: 'your-smtp-password'
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+# The directory from which notification templates are read.
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  receiver: 'web.hook'
+  routes:
+    # Critical security alerts - immediate escalation
+    - match_re:
+        severity: critical
+        service: security
+      receiver: 'security-critical'
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 5m
+      
+    # Authorization SLA violations - immediate notification
+    - match:
+        alertname: AuthorizationSLAViolation
+      receiver: 'performance-team'
+      group_wait: 30s
+      group_interval: 2m
+      repeat_interval: 30m
+      
+    # Cache performance issues
+    - match:
+        service: cache
+        severity: warning
+      receiver: 'infrastructure-team'
+      group_wait: 1m
+      group_interval: 5m
+      repeat_interval: 1h
+      
+    # Application health issues
+    - match_re:
+        alertname: VelroBackendDown|HighHTTPErrorRate
+      receiver: 'on-call-escalation'
+      group_wait: 15s
+      group_interval: 1m
+      repeat_interval: 10m
+      
+    # Database and system issues
+    - match:
+        service: database
+      receiver: 'infrastructure-team'
+      group_wait: 1m
+      group_interval: 5m
+      repeat_interval: 2h
+      
+    # Compliance and audit issues
+    - match:
+        service: compliance
+      receiver: 'compliance-team'
+      group_wait: 5m
+      group_interval: 15m
+      repeat_interval: 4h
+
+receivers:
+  # Default webhook receiver
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://localhost:5001/webhook'
+        send_resolved: true
+
+  # Security team - critical security incidents
+  - name: 'security-critical'
+    email_configs:
+      - to: 'security-team@velro.com'
+        subject: '🚨 CRITICAL SECURITY ALERT: {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Severity: {{ .Labels.severity }}
+          Source IP: {{ .Labels.source_ip }}
+          Impact: {{ .Annotations.impact }}
+          Action Required: {{ .Annotations.action_required }}
+          
+          Runbook: {{ .Annotations.runbook_url }}
+          {{ end }}
+        
+    slack_configs:
+      - channel: '#security-alerts'
+        color: 'danger'
+        title: '🚨 Critical Security Alert'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Source IP:* {{ .Labels.source_ip }}
+          *Action Required:* {{ .Annotations.action_required }}
+          {{ end }}
+        send_resolved: true
+        
+    webhook_configs:
+      - url: 'https://your-siem-system.com/api/alerts'
+        send_resolved: true
+        http_config:
+          bearer_token: 'your-siem-api-token'
+
+  # Performance team - SLA and performance issues
+  - name: 'performance-team'
+    email_configs:
+      - to: 'performance-team@velro.com'
+        subject: '⚡ Performance Alert: {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Current Value: {{ .Annotations.value }}
+          Target: {{ .Annotations.target }}
+          
+          This alert indicates performance degradation that may impact user experience.
+          Please investigate immediately.
+          
+          Runbook: {{ .Annotations.runbook_url }}
+          {{ end }}
+        
+    slack_configs:
+      - channel: '#performance-alerts'
+        color: 'warning'
+        title: '⚡ Performance Alert'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Impact:* {{ .Annotations.impact }}
+          {{ end }}
+
+  # Infrastructure team - system and cache issues
+  - name: 'infrastructure-team'
+    email_configs:
+      - to: 'infrastructure@velro.com'
+        subject: '🔧 Infrastructure Alert: {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Service: {{ .Labels.service }}
+          
+          Please check system health and resource utilization.
+          {{ end }}
+        
+    slack_configs:
+      - channel: '#infrastructure'
+        color: 'warning'
+        title: '🔧 Infrastructure Alert'
+        text: |
+          {{ range .Alerts }}
+          *Service:* {{ .Labels.service }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ end }}
+
+  # On-call escalation for critical application issues
+  - name: 'on-call-escalation'
+    email_configs:
+      - to: 'on-call@velro.com'
+        subject: '🆘 CRITICAL: {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          CRITICAL APPLICATION ISSUE DETECTED
+          
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Impact: {{ .Annotations.impact }}
+          
+          IMMEDIATE ACTION REQUIRED
+          
+          Time: {{ .StartsAt }}
+          {{ end }}
+        
+    slack_configs:
+      - channel: '#critical-alerts'
+        color: 'danger'
+        title: '🆘 CRITICAL ALERT - IMMEDIATE ACTION REQUIRED'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Impact:* {{ .Annotations.impact }}
+          *Started:* {{ .StartsAt }}
+          {{ end }}
+        
+    # PagerDuty integration for critical alerts
+    pagerduty_configs:
+      - service_key: 'your-pagerduty-service-key'
+        description: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        details:
+          alert_name: '{{ .GroupLabels.alertname }}'
+          description: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+          impact: '{{ range .Alerts }}{{ .Annotations.impact }}{{ end }}'
+
+  # Compliance team - audit and regulatory issues
+  - name: 'compliance-team'
+    email_configs:
+      - to: 'compliance@velro.com'
+        subject: '📋 Compliance Alert: {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Compliance Issue Detected:
+          
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Compliance Impact: {{ .Annotations.compliance_impact }}
+          
+          Please review audit logs and ensure regulatory compliance.
+          {{ end }}
+
+# Inhibit rules to reduce alert noise
+inhibit_rules:
+  # Inhibit any warning-level alerts when there are critical alerts
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+
+  # Inhibit cache alerts when Redis is down
+  - source_match:
+      alertname: 'RedisConnectionDown'
+    target_match_re:
+      alertname: '.*Cache.*'
+    equal: ['instance']
+    
+  # Inhibit performance alerts when application is down
+  - source_match:
+      alertname: 'VelroBackendDown'
+    target_match_re:
+      alertname: 'AuthorizationSLA.*|Slow.*'
+    equal: ['instance']
+
+# Templates for custom alert formatting
+templates:
+  - '/etc/alertmanager/templates/default.tmpl'

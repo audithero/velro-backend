@@ -1,0 +1,993 @@
+"""
+Database connection and session management for Supabase.
+Following CLAUDE.md: Pure database layer, no business logic.
+Fixed for Railway deployment with updated Supabase client.
+"""
+from supabase import create_client, Client
+from typing import Optional, Dict, Any, List
+from config import settings
+import asyncio
+import httpx
+import logging
+import os
+import time
+
+# Import performance monitoring (lazy import to avoid circular dependencies)
+try:
+    from utils.database_performance_monitor import record_query
+except ImportError:
+    # Fallback if performance monitor not available
+    def record_query(query_type: str, execution_time_ms: float, success: bool = True, context: dict = None, cache_hit: bool = False):
+        pass
+
+logger = logging.getLogger(__name__)
+
+
+class SupabaseClient:
+    """Supabase client wrapper with connection management."""
+    
+    def __init__(self):
+        self._client: Optional[Client] = None
+        self._service_client: Optional[Client] = None
+        self._is_available: Optional[bool] = None
+        self._service_key_valid: Optional[bool] = None
+    
+    @property
+    def client(self) -> Client:
+        """Get client with anon key (for user operations)."""
+        if self._client is None:
+            logger.info(f"Creating Supabase client with URL: {settings.supabase_url[:50]}...")
+            try:
+                self._client = create_client(
+                    settings.supabase_url,
+                    settings.supabase_anon_key
+                )
+                logger.info("✅ Supabase client created successfully")
+            except Exception as e:
+                logger.error(f"❌ Failed to create Supabase client: {e}")
+                raise
+        return self._client
+    
+    @property
+    def service_client(self) -> Client:
+        """Get client with service key (for admin operations, bypasses RLS)."""
+        if self._service_client is None:
+            logger.info(f"Creating Supabase service client with URL: {settings.supabase_url[:50]}...")
+            logger.info(f"Service key length: {len(settings.supabase_service_role_key)}")
+            logger.info(f"Service key starts with: {settings.supabase_service_role_key[:10]}...")
+            try:
+                # Validate service key format
+                if not settings.supabase_service_role_key.startswith(('eyJ', 'sb-', 'sb_secret_')):
+                    logger.warning(f"⚠️ Service key format may be invalid (doesn't start with eyJ, sb-, or sb_secret_)")
+                
+                # CRITICAL FIX: Handle raw format service keys (sb_secret_*)
+                if settings.supabase_service_role_key.startswith('sb_secret_'):
+                    logger.info("🔧 Raw format service key detected - implementing hybrid approach")
+                    # For raw format keys, the supabase-py client fails, but API calls work
+                    # We'll create a client with anon key but track service key separately for HTTP calls
+                    self._service_client = create_client(
+                        settings.supabase_url,
+                        settings.supabase_anon_key  # Use anon client as base
+                    )
+                    # Store raw service key for direct API usage
+                    self._raw_service_key = settings.supabase_service_role_key
+                    logger.info("✅ Hybrid service client created (anon base + raw service key)")
+                else:
+                    # Standard JWT format
+                    self._service_client = create_client(
+                        settings.supabase_url,
+                        settings.supabase_service_role_key
+                    )
+                    self._raw_service_key = None
+                    logger.info("✅ Standard JWT service client created")
+                
+                # CRITICAL FIX: Enhanced service client validation with comprehensive error handling
+                try:
+                    # ENHANCED: More robust service key validation with better error detection
+                    logger.info(f"🔍 [DATABASE] Testing service key authentication...")
+                    
+                    # Test 1: Basic authentication test with simple query
+                    try:
+                        # If using raw service key, test with HTTP request instead of client
+                        if hasattr(self, '_raw_service_key') and self._raw_service_key:
+                            import requests
+                            response = requests.get(
+                                f"{settings.supabase_url}/rest/v1/users?select=count",
+                                headers={
+                                    "Authorization": f"Bearer {self._raw_service_key}",
+                                    "apikey": self._raw_service_key
+                                },
+                                timeout=5
+                            )
+                            if response.status_code == 200:
+                                logger.info(f"✅ [DATABASE] Raw service key HTTP test passed")
+                                self._service_key_valid = True
+                            else:
+                                logger.error(f"❌ [DATABASE] Raw service key HTTP test failed: {response.status_code}")
+                                self._service_key_valid = False
+                        else:
+                            # Standard client test for JWT keys
+                            test_result = self._service_client.table("users").select("count").execute()
+                            logger.info(f"✅ [DATABASE] Service key basic auth test passed")
+                            self._service_key_valid = True
+                        
+                        # Test 2: RLS bypass validation
+                        try:
+                            rls_test = self._service_client.table("credit_transactions").select("id").limit(1).execute()
+                            logger.info(f"✅ [DATABASE] Service client RLS bypass confirmed")
+                        except Exception as rls_error:
+                            logger.warning(f"⚠️ [DATABASE] Service client RLS test failed: {rls_error}")
+                            # RLS failure doesn't invalidate the key - just means limited permissions
+                            
+                        # Test 3: Auth operations capability (critical for user management)
+                        try:
+                            # Test if we can perform auth-related operations
+                            auth_test = self._service_client.table("users").select("id").limit(1).execute()
+                            logger.info(f"✅ [DATABASE] Service client can access user data")
+                        except Exception as auth_error:
+                            logger.warning(f"⚠️ [DATABASE] Service client auth operations test failed: {auth_error}")
+                            # This could indicate the "Database error granting user" issue
+                            if "granting user" in str(auth_error).lower() or "database error" in str(auth_error).lower():
+                                logger.error(f"🚨 [DATABASE] DETECTED: 'Database error granting user' issue in service key")
+                                logger.error(f"🔧 [DATABASE] SOLUTION: This indicates Supabase Auth RLS policy conflicts")
+                                logger.error(f"🔧 [DATABASE] RECOMMENDATION: Check auth.users table policies and service role permissions")
+                                # Mark as potentially problematic but not invalid
+                                self._service_key_valid = True  # Keep as valid but with warnings
+                            
+                    except Exception as basic_test_error:
+                        logger.error(f"❌ [DATABASE] Service key basic test failed: {basic_test_error}")
+                        
+                        # Enhanced error analysis for service key issues
+                        error_str = str(basic_test_error).lower()
+                        if "invalid api key" in error_str or "unauthorized" in error_str:
+                            logger.error(f"🚨 [DATABASE] CRITICAL: Service key is invalid or unauthorized")
+                            logger.error(f"🔧 [DATABASE] SOLUTION: Regenerate SUPABASE_SERVICE_ROLE_KEY in Supabase dashboard")
+                            self._service_key_valid = False
+                        elif "database error granting user" in error_str:
+                            logger.error(f"🚨 [DATABASE] CRITICAL: Database error granting user - Auth/RLS conflict detected")
+                            logger.error(f"🔧 [DATABASE] SOLUTION: Check Supabase Auth table policies and RLS settings")
+                            logger.error(f"🔧 [DATABASE] WORKAROUND: Service key may work for some operations but fail for auth")
+                            # This is the exact error from the user's report
+                            self._service_key_valid = False  # Mark as invalid due to auth conflicts
+                        elif "jwt" in error_str or "token" in error_str:
+                            logger.error(f"🚨 [DATABASE] CRITICAL: Service key JWT format issue")
+                            logger.error(f"🔧 [DATABASE] SOLUTION: Verify service key is properly formatted JWT")
+                            self._service_key_valid = False
+                        elif "network" in error_str or "connection" in error_str:
+                            logger.warning(f"⚠️ [DATABASE] Network connectivity issue - service key may be valid")
+                            logger.warning(f"🔧 [DATABASE] Retry connection or check network")
+                            self._service_key_valid = None  # Uncertain - could be valid
+                        else:
+                            logger.warning(f"⚠️ [DATABASE] Unknown service key test error: {basic_test_error}")
+                            # Default to optimistic validation for unknown errors
+                            self._service_key_valid = True
+                        
+                except Exception as test_error:
+                    logger.error(f"❌ Service client test failed: {test_error}")
+                    logger.error(f"❌ Error type: {type(test_error).__name__}")
+                    logger.error(f"❌ Error details: {getattr(test_error, 'message', str(test_error))}")
+                    
+                    # ENHANCED ERROR ANALYSIS
+                    error_str = str(test_error).lower()
+                    if "invalid api key" in error_str:
+                        logger.error(f"🔑 DIAGNOSIS: Service key is completely invalid or expired")
+                        logger.error(f"🔧 SOLUTION: Need to regenerate service key in Supabase dashboard")
+                        self._service_key_valid = False
+                    elif "jwt" in error_str or "token" in error_str:
+                        logger.error(f"🔑 DIAGNOSIS: Service key JWT token issue")
+                        logger.error(f"🔧 SOLUTION: Check if service key is properly formatted JWT")
+                        self._service_key_valid = False
+                    elif "not found" in error_str or "relation" in error_str:
+                        logger.warning(f"🗃️ Database schema/table access issue - service key is valid")
+                        # Schema issues don't invalidate authentication - service key is valid
+                        self._service_key_valid = True
+                    else:
+                        # Non-auth errors should not invalidate the key
+                        self._service_key_valid = True
+                        logger.warning(f"⚠️ Service key valid but test failed: {test_error}")
+                    
+                    if not self._service_key_valid:
+                        logger.error(f"🚨 CRITICAL: Service key marked as invalid - operations will fallback to anon key")
+                        logger.error(f"🚨 IMPORTANT: Credit operations will require proper JWT authentication")
+                        logger.error(f"⚠️ WARNING: Profile lookups may fail without service key")
+                    else:
+                        logger.info(f"✅ OPTIMISTIC: Service key marked as valid despite test failure")
+                    # CRITICAL FIX: Don't set service_client to None - keep it for potential fallback
+                    # self._service_client = None  # This breaks the fallback mechanism!
+                    
+                    logger.warning(f"🔄 FALLBACK: Service operations will use anon client with JWT context")
+                    
+            except Exception as e:
+                logger.error(f"❌ Failed to create Supabase service client: {e}")
+                logger.error(f"❌ Service key length: {len(settings.supabase_service_role_key)}")
+                logger.error(f"❌ Service key format check: {settings.supabase_service_role_key[:20]}...")
+                logger.error(f"🚨 CRITICAL: Service client creation failed - operations will fallback to anon key")
+                logger.error(f"🔧 SOLUTION: Check if SUPABASE_SERVICE_ROLE_KEY environment variable is set correctly")
+                
+                self._service_key_valid = False
+                # CRITICAL FIX: Don't nullify service client - keep for fallback
+                # self._service_client = None
+                # Don't raise - fallback mechanism will handle this
+                
+        return self._service_client
+    
+    @property
+    def storage(self):
+        """Get storage client (uses service key for admin operations)."""
+        return self.service_client.storage
+    
+    def is_available(self) -> bool:
+        """Check if Supabase is available - Railway optimized."""
+        if self._is_available is not None:
+            return self._is_available
+        
+        try:
+            # Quick connection test
+            client = self.client
+            result = client.table("users").select("id").limit(1).execute()
+            
+            self._is_available = result.data is not None
+            if self._is_available:
+                logger.info("✅ Supabase connection verified")
+            else:
+                logger.warning("⚠️ Supabase connection failed")
+            return self._is_available
+                
+        except Exception as e:
+            logger.error(f"❌ Supabase connection error: {e}")
+            self._is_available = False
+            return False
+    
+    async def execute_parallel_queries(
+        self,
+        queries: List[Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]],  # (table, operation, data, filters)
+        user_id: Optional[str] = None,
+        use_service_key: bool = False,
+        auth_token: Optional[str] = None
+    ) -> List[Any]:
+        """
+        Execute multiple queries in parallel for maximum performance.
+        Critical for eliminating sequential query bottlenecks.
+        
+        Args:
+            queries: List of (table, operation, data, filters) tuples
+            user_id: User ID for RLS context
+            use_service_key: Whether to use service key
+            auth_token: JWT token for authentication
+        """
+        if not self.is_available():
+            raise ConnectionError("Supabase database is not available")
+            
+        try:
+            import asyncio
+            start_time = time.time()
+            
+            # Create tasks for parallel execution
+            tasks = []
+            for table, operation, data, filters in queries:
+                task = asyncio.create_task(
+                    self._execute_single_query(table, operation, data, filters, user_id, use_service_key, auth_token)
+                )
+                tasks.append(task)
+            
+            # Execute all queries in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            logger.info(f"🚀 [DATABASE] Parallel execution: {len(queries)} queries in {execution_time:.2f}ms")
+            
+            # Check for exceptions and handle them
+            processed_results = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ [DATABASE] Query {i} failed in parallel batch: {result}")
+                    raise result
+                processed_results.append(result)
+            
+            return processed_results
+            
+        except Exception as e:
+            logger.error(f"❌ [DATABASE] Parallel query execution failed: {e}")
+            raise
+    
+    async def _execute_single_query(
+        self,
+        table: str,
+        operation: str,
+        data: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        use_service_key: bool = False,
+        auth_token: Optional[str] = None
+    ) -> Any:
+        """Internal method for single query execution used by parallel processing."""
+        return self.execute_query(table, operation, data, filters, user_id, use_service_key, False, None, None, None, auth_token)
+    
+    def execute_query(
+        self, 
+        table: str, 
+        operation: str, 
+        data: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        use_service_key: bool = False,
+        single: bool = False,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        auth_token: Optional[str] = None
+    ) -> Any:
+        """
+        Execute database query with proper error handling.
+        
+        Args:
+            table: Table name
+            operation: 'select', 'insert', 'update', 'delete'
+            data: Data for insert/update operations
+            filters: Filters for select/update/delete operations
+            user_id: User ID for RLS context
+            use_service_key: Whether to use service key (bypasses RLS)
+            single: Return single record instead of list
+            order_by: Order by clause (e.g., "created_at:desc")
+            limit: Limit number of results
+            offset: Offset for pagination
+        """
+        # Start performance timing
+        start_time = time.time()
+        success = True
+        query_type = "auth" if table in ["users", "user_profiles"] and operation == "select" else "general"
+        
+        if not self.is_available():
+            raise ConnectionError("Supabase database is not available. Check API keys and connection.")
+        
+        try:
+            # CRITICAL FIX: Corrected client selection logic to prevent anon fallback when service key is valid
+            if use_service_key:
+                if self._service_key_valid is True:
+                    try:
+                        client = self.service_client
+                        logger.info(f"🔑 [DATABASE] Using SERVICE client for {operation} on {table}")
+                        logger.info(f"🔑 [DATABASE] Service client bypasses RLS - operation: {operation}, table: {table}")
+                    except Exception as service_client_error:
+                        logger.error(f"❌ [DATABASE] Service client access failed despite valid key: {service_client_error}")
+                        logger.error(f"❌ [DATABASE] Error type: {type(service_client_error).__name__}")
+                        logger.error(f"🔧 [DATABASE] EXCEPTION FALLBACK: Switching to anon client")
+                        
+                        client = self.client
+                        use_service_key = False
+                        logger.info(f"🔓 [DATABASE] EXCEPTION FALLBACK: Using ANON client for {operation} on {table}")
+                else:
+                    logger.error(f"🚨 [DATABASE] Service key requested but invalid for {operation} on {table}")
+                    if not auth_token:
+                        raise ValueError("Service key invalid and no JWT token provided")
+                    client = self.client
+                    use_service_key = False
+                    logger.warning(f"🔧 [DATABASE] FALLBACK: Using ANON client with JWT for {operation} on {table}")
+                    
+                    # Enhanced JWT requirement warning
+                    if table in ['users', 'credit_transactions', 'generations'] and operation in ['select', 'update', 'insert']:
+                        logger.error(f"🚨 [DATABASE] CRITICAL: Table '{table}' operation '{operation}' typically requires service key or JWT")
+                        logger.error(f"⚠️ [DATABASE] Without service key, this operation may fail due to RLS policies")
+            else:
+                client = self.client
+                logger.info(f"🔓 [DATABASE] Using ANON client for {operation} on {table} (as requested)")
+                logger.info(f"🛡️ [DATABASE] Anon client subject to RLS policies - operation: {operation}, table: {table}")
+                
+                # CRITICAL FIX: Enhanced JWT token handling for anon client with proper session management
+                if user_id and auth_token:
+                    logger.info(f"🔐 [DATABASE] Setting JWT token for user {user_id} in anon client")
+                    try:
+                        # Handle different token formats with enhanced validation
+                        if auth_token.startswith("supabase_token_") or auth_token.startswith("mock_token_"):
+                            # Custom token format - skip JWT setting but log for debugging
+                            logger.info(f"🔧 [DATABASE] Custom token format detected ({auth_token[:20]}...), skipping JWT session setup")
+                        else:
+                            # Real Supabase JWT token - enhanced session handling
+                            logger.info(f"🔑 [DATABASE] Setting real Supabase JWT session for user {user_id}")
+                            
+                            # CRITICAL FIX: Enhanced session setup with better error handling
+                            try:
+                                # Correct Supabase session handling
+                                client.auth.set_session({
+                                    "access_token": auth_token,
+                                    "refresh_token": None
+                                })
+                                logger.info(f"✅ [DATABASE] JWT session set successfully for user {user_id}")
+                                
+                            except Exception as session_error:
+                                logger.warning(f"⚠️ [DATABASE] Direct session set failed, trying header approach: {session_error}")
+                                # Use headers as fallback
+                                try:
+                                    client.auth._headers = {
+                                        **getattr(client.auth, '_headers', {}),
+                                        "Authorization": f"Bearer {auth_token}"
+                                    }
+                                    logger.info(f"✅ [DATABASE] Using header fallback for JWT")
+                                except Exception as header_error:
+                                    logger.error(f"❌ [DATABASE] Header fallback also failed: {header_error}")
+                                
+                                # Method 2: Fallback - set Authorization header directly (if supported)
+                                try:
+                                    # Some Supabase operations may work with direct header setting
+                                    client.auth.session = {"access_token": auth_token}
+                                    logger.info(f"✅ [DATABASE] JWT token set via fallback method for user {user_id}")
+                                except Exception as fallback_error:
+                                    logger.warning(f"⚠️ [DATABASE] Fallback JWT method also failed: {fallback_error}")
+                                    logger.warning(f"⚠️ [DATABASE] Proceeding without JWT session - RLS may block access")
+                                    
+                    except Exception as jwt_error:
+                        logger.error(f"❌ [DATABASE] Failed to set JWT token for user {user_id}: {jwt_error}")
+                        logger.error(f"❌ [DATABASE] JWT error type: {type(jwt_error).__name__}")
+                        # Continue without token - may fail with RLS error
+                        
+                elif user_id and not use_service_key and not auth_token:
+                    logger.warning(f"⚠️ [DATABASE] Need user context for {user_id} but no auth_token provided - RLS may block access")
+                    # For server-side operations without JWT token, we may need to use service key
+                    logger.warning(f"⚠️ [DATABASE] Consider using use_service_key=True for server-side operations")
+                    
+                elif not user_id and not use_service_key:
+                    logger.warning(f"⚠️ [DATABASE] No user context available - operation may fail with RLS policies")
+            
+            logger.info(f"🔍 [DATABASE] Creating query for {operation} on {table}, filters: {filters}")
+            query = client.table(table)
+            
+            if operation == "select":
+                query = query.select("*")
+                
+                if filters:
+                    for key, value in filters.items():
+                        query = query.eq(key, value)
+                
+                # Apply ordering
+                if order_by:
+                    if ":" in order_by:
+                        column, direction = order_by.split(":")
+                        if direction.lower() == "desc":
+                            query = query.order(column, desc=True)
+                        else:
+                            query = query.order(column)
+                    else:
+                        query = query.order(order_by)
+                
+                # Apply pagination
+                if limit:
+                    query = query.limit(limit)
+                if offset:
+                    query = query.range(offset, offset + limit - 1 if limit else offset + 100)
+                
+                logger.info(f"🔍 [DATABASE] Executing SELECT query on {table}")
+                result = query.execute()
+                logger.info(f"🔍 [DATABASE] SELECT result for {table}: {len(result.data) if result.data else 0} rows")
+                
+                if single and result.data:
+                    logger.info(f"✅ [DATABASE] Returning single record from {table}")
+                    return result.data[0]
+                    
+                logger.info(f"✅ [DATABASE] Returning {len(result.data) if result.data else 0} records from {table}")
+                return result.data
+            
+            elif operation == "insert":
+                if not data:
+                    raise ValueError("Data required for insert operation")
+                    
+                logger.info(f"🔍 [DATABASE] Executing INSERT query on {table} with data keys: {list(data.keys()) if data else []}")
+                result = query.insert(data).execute()
+                logger.info(f"🔍 [DATABASE] INSERT result for {table}: {len(result.data) if result.data else 0} rows created")
+                
+                if single:
+                    logger.info(f"✅ [DATABASE] Returning single inserted record from {table}")
+                    return result.data[0] if result.data else None
+                    
+                logger.info(f"✅ [DATABASE] Returning {len(result.data) if result.data else 0} inserted records from {table}")
+                return result.data
+            
+            elif operation == "update":
+                if not data:
+                    raise ValueError("Data required for update operation")
+                    
+                logger.info(f"🔍 [DATABASE] Executing UPDATE query on {table} with data keys: {list(data.keys()) if data else []}")
+                query = query.update(data)
+                if filters:
+                    for key, value in filters.items():
+                        query = query.eq(key, value)
+                        
+                result = query.execute()
+                logger.info(f"🔍 [DATABASE] UPDATE result for {table}: {len(result.data) if result.data else 0} rows updated")
+                
+                if single:
+                    logger.info(f"✅ [DATABASE] Returning single updated record from {table}")
+                    return result.data[0] if result.data else None
+                    
+                logger.info(f"✅ [DATABASE] Returning {len(result.data) if result.data else 0} updated records from {table}")
+                return result.data
+            
+            elif operation == "delete":
+                query = query.delete()
+                if filters:
+                    for key, value in filters.items():
+                        query = query.eq(key, value)
+                result = query.execute()
+                
+                # Record successful query performance
+                execution_time_ms = (time.time() - start_time) * 1000
+                record_query(
+                    query_type=query_type,
+                    execution_time_ms=execution_time_ms,
+                    success=True,
+                    context={
+                        "table": table,
+                        "operation": operation,
+                        "use_service_key": use_service_key,
+                        "has_filters": bool(filters),
+                        "single": single
+                    }
+                )
+                
+                return result.data
+            
+            else:
+                raise ValueError(f"Unsupported operation: {operation}")
+                
+        except Exception as e:
+            # Record failed query performance
+            execution_time_ms = (time.time() - start_time) * 1000
+            record_query(
+                query_type=query_type,
+                execution_time_ms=execution_time_ms,
+                success=False,
+                context={
+                    "table": table,
+                    "operation": operation,
+                    "error": str(e),
+                    "use_service_key": use_service_key
+                }
+            )
+            logger.error(f"Database query failed: {e}")
+            raise
+    
+    def execute_rpc(
+        self, 
+        function_name: str, 
+        params: Optional[Dict[str, Any]] = None,
+        use_service_key: bool = False
+    ) -> Any:
+        """Execute Supabase RPC function."""
+        try:
+            client = self.client
+            result = client.rpc(function_name, params or {}).execute()
+            return result.data
+        except Exception as e:
+            logger.error(f"RPC function {function_name} failed: {e}")
+            raise
+    
+    async def execute_materialized_view_query(
+        self,
+        view_name: str,
+        filters: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        limit: Optional[int] = None,
+        order_by: Optional[str] = None
+    ) -> Any:
+        """
+        Execute optimized query against materialized views for maximum performance.
+        Uses existing materialized views from migrations 012 and 013.
+        
+        Args:
+            view_name: Name of materialized view (mv_user_authorization_context, etc.)
+            filters: Filters to apply to the view
+            user_id: User ID for context
+            auth_token: JWT token
+            limit: Limit results
+            order_by: Order by clause
+        """
+        if not self.is_available():
+            raise ConnectionError("Supabase database is not available")
+            
+        try:
+            start_time = time.time()
+            
+            # Use service client for materialized views to bypass RLS overhead
+            client = self.service_client
+            
+            logger.info(f"📊 [DATABASE] Querying materialized view: {view_name}")
+            
+            # Build optimized query for materialized view
+            query = client.table(view_name).select("*")
+            
+            # Apply filters efficiently
+            if filters:
+                for key, value in filters.items():
+                    if isinstance(value, list):
+                        query = query.in_(key, value)
+                    else:
+                        query = query.eq(key, value)
+            
+            # Apply ordering
+            if order_by:
+                if ":" in order_by:
+                    column, direction = order_by.split(":")
+                    query = query.order(column, desc=(direction.lower() == "desc"))
+                else:
+                    query = query.order(order_by)
+            
+            # Apply limit
+            if limit:
+                query = query.limit(limit)
+            
+            result = query.execute()
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            logger.info(f"📊 [DATABASE] Materialized view query completed in {execution_time:.2f}ms, {len(result.data) if result.data else 0} rows")
+            
+            # Log performance for views that should be <10ms
+            if execution_time > 20:
+                logger.warning(f"⚠️ [DATABASE] Materialized view query exceeded target: {execution_time:.2f}ms (target: <20ms)")
+            elif execution_time < 10:
+                logger.debug(f"🎯 [DATABASE] Excellent materialized view performance: {execution_time:.2f}ms")
+            
+            return result.data
+            
+        except Exception as e:
+            logger.error(f"❌ [DATABASE] Materialized view query failed for {view_name}: {e}")
+            raise
+    
+    async def execute_authorization_check_optimized(
+        self,
+        user_id: str,
+        resource_type: str,
+        resource_id: str,
+        operation: str = "read"
+    ) -> Dict[str, Any]:
+        """
+        Execute ultra-fast authorization check using materialized views and optimized queries.
+        Target: <20ms execution time.
+        
+        Args:
+            user_id: User ID to check authorization for
+            resource_type: Type of resource (generation, project, etc.)
+            resource_id: ID of resource
+            operation: Operation type (read, write, delete)
+        """
+        try:
+            start_time = time.time()
+            
+            # Use materialized view for generation authorization (fastest path)
+            if resource_type == "generation":
+                result = await self.execute_materialized_view_query(
+                    "mv_user_authorization_context",
+                    filters={
+                        "user_id": user_id,
+                        "generation_id": resource_id
+                    },
+                    limit=1
+                )
+                
+                if result:
+                    execution_time = (time.time() - start_time) * 1000
+                    logger.info(f"🎯 [DATABASE] Ultra-fast auth check via materialized view: {execution_time:.2f}ms")
+                    
+                    return {
+                        "access_granted": result[0]["has_read_access"] if operation == "read" else result[0]["has_write_access"],
+                        "effective_role": result[0]["effective_role"],
+                        "access_method": "materialized_view_cache",
+                        "execution_time_ms": execution_time
+                    }
+            
+            # Fallback to direct queries with prepared statements for other resources
+            auth_result = await self._execute_direct_auth_check(user_id, resource_type, resource_id, operation)
+            
+            execution_time = (time.time() - start_time) * 1000
+            auth_result["execution_time_ms"] = execution_time
+            
+            return auth_result
+            
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"❌ [DATABASE] Authorization check failed after {execution_time:.2f}ms: {e}")
+            raise
+    
+    async def _execute_direct_auth_check(
+        self,
+        user_id: str,
+        resource_type: str,
+        resource_id: str,
+        operation: str
+    ) -> Dict[str, Any]:
+        """Execute direct authorization check with optimized queries."""
+        
+        if resource_type == "project":
+            # Optimized project authorization query
+            result = self.execute_query(
+                table="projects",
+                operation="select",
+                filters={"id": resource_id},
+                use_service_key=True,
+                single=True
+            )
+            
+            if not result:
+                return {
+                    "access_granted": False,
+                    "effective_role": "none",
+                    "access_method": "direct_query_not_found"
+                }
+            
+            # Check ownership or visibility
+            if result["user_id"] == user_id:
+                return {
+                    "access_granted": True,
+                    "effective_role": "owner",
+                    "access_method": "direct_ownership"
+                }
+            elif result["visibility"] == "public":
+                return {
+                    "access_granted": True,
+                    "effective_role": "viewer",
+                    "access_method": "public_visibility"
+                }
+        
+        # Default deny
+        return {
+            "access_granted": False,
+            "effective_role": "none",
+            "access_method": "direct_query_denied"
+        }
+    
+    async def execute_batch_with_prepared_statements(
+        self,
+        queries: List[Tuple[str, List[Any]]],  # (prepared_query, parameters)
+        use_service_key: bool = True
+    ) -> List[Any]:
+        """
+        Execute batch of queries using prepared statements for maximum performance.
+        
+        Args:
+            queries: List of (prepared_query, parameters) tuples
+            use_service_key: Whether to use service key for optimal performance
+        """
+        try:
+            start_time = time.time()
+            
+            # For Supabase, we'll use the RPC function approach for batch execution
+            client = self.service_client if use_service_key else self.client
+            
+            # Execute queries in parallel batches for optimal performance
+            import asyncio
+            
+            async def execute_single(query, params):
+                try:
+                    # Convert query to Supabase format
+                    return await self._execute_prepared_query(query, params, client)
+                except Exception as e:
+                    logger.error(f"❌ [DATABASE] Prepared query failed: {e}")
+                    return None
+            
+            # Execute all queries in parallel
+            tasks = [execute_single(query, params) for query, params in queries]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            logger.info(f"🚀 [DATABASE] Batch prepared statements: {len(queries)} queries in {execution_time:.2f}ms")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ [DATABASE] Batch prepared statement execution failed: {e}")
+            raise
+    
+    async def _execute_prepared_query(self, query: str, params: List[Any], client) -> Any:
+        """Execute a single prepared query efficiently."""
+        # For Supabase, we'll need to adapt queries to PostgREST format
+        # This is a simplified implementation - full implementation would need query parsing
+        
+        try:
+            # Convert parameterized query to Supabase table operation where possible
+            if "SELECT" in query.upper() and "FROM users WHERE id" in query:
+                # User lookup optimization
+                if len(params) == 1:
+                    result = client.table("users").select("*").eq("id", params[0]).execute()
+                    return result.data
+            
+            # Fallback to RPC if available
+            return await self.execute_rpc("execute_prepared_query", {
+                "query_text": query,
+                "query_params": params
+            }, use_service_key=True)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ [DATABASE] Prepared query fallback: {e}")
+            return None
+    
+    def execute_raw_query(
+        self, 
+        query: str, 
+        params: Optional[List[Any]] = None,
+        use_service_key: bool = False,
+        auth_token: Optional[str] = None,
+        user_id: Optional[str] = None
+    ) -> Any:
+        """
+        Execute raw SQL query with parameter binding.
+        
+        Args:
+            query: Raw SQL query with %s placeholders
+            params: Parameters to bind to the query
+            use_service_key: Whether to use service key (bypasses RLS)
+            auth_token: JWT token for authentication
+            user_id: User ID for context
+        """
+        if not self.is_available():
+            raise ConnectionError("Supabase database is not available. Check API keys and connection.")
+        
+        try:
+            # Select appropriate client
+            if use_service_key:
+                if self._service_key_valid is True:
+                    try:
+                        client = self.service_client
+                        logger.info(f"🔑 [DATABASE] Using SERVICE client for raw query execution")
+                    except Exception as service_client_error:
+                        logger.error(f"❌ [DATABASE] Service client access failed: {service_client_error}")
+                        client = self.client
+                        use_service_key = False
+                        logger.info(f"🔧 [DATABASE] FALLBACK: Using ANON client for raw query")
+                else:
+                    logger.error(f"🚨 [DATABASE] Service key requested but invalid for raw query")
+                    if not auth_token:
+                        raise ValueError("Service key invalid and no JWT token provided for raw query")
+                    client = self.client
+                    use_service_key = False
+                    logger.warning(f"🔧 [DATABASE] FALLBACK: Using ANON client with JWT for raw query")
+            else:
+                client = self.client
+                logger.info(f"🔓 [DATABASE] Using ANON client for raw query")
+                
+                # Handle JWT authentication for anon client
+                if user_id and auth_token:
+                    logger.info(f"🔐 [DATABASE] Setting JWT token for user {user_id} in raw query")
+                    try:
+                        if not (auth_token.startswith("supabase_token_") or auth_token.startswith("mock_token_")):
+                            client.auth.set_session({
+                                "access_token": auth_token,
+                                "refresh_token": None
+                            })
+                            logger.info(f"✅ [DATABASE] JWT session set for raw query")
+                    except Exception as jwt_error:
+                        logger.error(f"❌ [DATABASE] Failed to set JWT for raw query: {jwt_error}")
+            
+            # Execute raw query using RPC to get_query_results or direct PostgREST if supported
+            # Since Supabase doesn't directly support raw SQL in the client, we'll use RPC
+            # First, let's try to use the PostgREST query parameter approach
+            
+            try:
+                # For PostgreSQL parameter binding, convert %s placeholders to $1, $2, etc.
+                formatted_query = query
+                if params:
+                    for i, param in enumerate(params, 1):
+                        formatted_query = formatted_query.replace('%s', f'${i}', 1)
+                
+                logger.info(f"🔍 [DATABASE] Executing raw query: {formatted_query[:100]}...")
+                logger.info(f"🔍 [DATABASE] Query parameters: {params}")
+                
+                # Use RPC to execute raw query - this assumes you have a stored function
+                # If not available, we'll need to create one or use an alternative approach
+                result = client.rpc('execute_raw_query', {
+                    'query_sql': formatted_query,
+                    'query_params': params or []
+                }).execute()
+                
+                logger.info(f"✅ [DATABASE] Raw query executed successfully via RPC")
+                return result.data
+                
+            except Exception as rpc_error:
+                logger.warning(f"⚠️ [DATABASE] RPC raw query failed, trying alternative approach: {rpc_error}")
+                
+                # Alternative: Try to create an equivalent query using the standard interface
+                # This is a fallback for when RPC functions are not available
+                logger.error(f"❌ [DATABASE] Raw query execution not supported without RPC function")
+                logger.error(f"🔧 [DATABASE] Please create the execute_raw_query RPC function in Supabase")
+                logger.error(f"🔧 [DATABASE] Or use the standard execute_query interface with separate queries")
+                
+                raise NotImplementedError(
+                    "Raw query execution requires the execute_raw_query RPC function to be created in Supabase. "
+                    "Please create this function or use the standard query interface."
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ [DATABASE] Raw query execution failed: {e}")
+            raise
+    
+
+
+# Global database instance
+db = SupabaseClient()
+
+
+async def get_database() -> SupabaseClient:
+    """Dependency injection for database client."""
+    return db
+
+
+def health_check() -> bool:
+    """Check database connection health - Railway optimized."""
+    try:
+        is_available = db.is_available()
+        return is_available
+    except Exception as e:
+        logger.debug(f"Database health check failed: {e}")
+        return False
+
+
+# =============================================================================
+# TABLE REFERENCE OBJECTS FOR SQLALCHEMY QUERIES
+# =============================================================================
+# These are simplified table references for raw SQL operations
+# The actual schema is managed by Supabase migrations
+
+class TableReference:
+    """Simple table reference for SQL operations."""
+    def __init__(self, name: str):
+        self.name = name
+    
+    @property
+    def c(self):
+        """Column accessor (simplified interface)."""
+        return ColumnAccessor(self.name)
+
+
+class ColumnAccessor:
+    """Column accessor for table references."""
+    def __init__(self, table_name: str):
+        self.table_name = table_name
+    
+    def __getattr__(self, column_name: str):
+        """Return column reference."""
+        return f"{self.table_name}.{column_name}"
+
+
+# Team collaboration table references
+teams_table = TableReference("teams")
+team_members_table = TableReference("team_members")
+team_invitations_table = TableReference("team_invitations")
+project_privacy_settings_table = TableReference("project_privacy_settings")
+project_teams_table = TableReference("project_teams")
+generation_collaborations_table = TableReference("generation_collaborations")
+
+# Existing table references
+users_table = TableReference("users")
+projects_table = TableReference("projects")
+generations_table = TableReference("generations")
+
+
+# =============================================================================
+# ASYNC SESSION MANAGEMENT FOR TEAM COLLABORATION
+# =============================================================================
+
+class AsyncSessionWrapper:
+    """Async session wrapper for team collaboration operations."""
+    
+    def __init__(self, db_client: SupabaseClient):
+        self.db_client = db_client
+    
+    async def execute(self, query, auth_token: str = None):
+        """Execute a query with proper authentication context."""
+        # This is a simplified interface - in production you'd want proper SQLAlchemy integration
+        # For now, we'll use the Supabase client directly
+        raise NotImplementedError("Use SupabaseClient.execute_query directly")
+    
+    async def commit(self):
+        """Commit transaction (no-op for Supabase)."""
+        pass
+    
+    async def rollback(self):
+        """Rollback transaction (no-op for Supabase)."""
+        pass
+
+
+async def get_async_session(auth_token: str = None) -> AsyncSessionWrapper:
+    """Get async session wrapper for database operations."""
+    return AsyncSessionWrapper(db)
