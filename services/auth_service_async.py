@@ -43,7 +43,9 @@ class AsyncAuthService:
         )
         
         # Create async HTTP client with timeout
-        # Use anon key for auth endpoints (required by Supabase Auth API)
+        # Use publishable key (anon key) for auth endpoints (required by Supabase Auth API)
+        # Fix: Use SUPABASE_PUBLISHABLE_KEY or fallback to SUPABASE_ANON_KEY
+        auth_key = os.getenv('SUPABASE_PUBLISHABLE_KEY') or settings.supabase_anon_key
         self.client = httpx.AsyncClient(
             base_url=settings.supabase_url,
             timeout=self.timeout,
@@ -53,10 +55,11 @@ class AsyncAuthService:
                 keepalive_expiry=30.0
             ),
             headers={
-                "apikey": settings.supabase_anon_key,
-                "Authorization": f"Bearer {settings.supabase_anon_key}",
+                "apikey": auth_key,
+                "Authorization": f"Bearer {auth_key}",
                 "Content-Type": "application/json"
-            }
+            },
+            http2=False  # Disable HTTP/2 for better compatibility with Supabase
         )
         
         # Service client for database operations
@@ -70,7 +73,8 @@ class AsyncAuthService:
                 "Authorization": f"Bearer {service_key}",
                 "Content-Type": "application/json",
                 "Prefer": "return=representation"
-            }
+            },
+            http2=False  # Disable HTTP/2 for better compatibility
         )
         
         logger.info(f"✅ [ASYNC-AUTH] Initialized with production timeouts (connect={self.timeout.connect}s, read={self.timeout.read}s, write={self.timeout.write}s, pool={self.timeout.pool}s)")
@@ -140,7 +144,7 @@ class AsyncAuthService:
                         "/auth/v1/token?grant_type=password",
                         json=auth_payload
                     ),
-                    timeout=10.0  # Increased to 10s to allow for Supabase latency
+                    timeout=8.5  # 8.5s to align with 8s read timeout + overhead
                 )
                 
                 request_time = (time.time() - request_start) * 1000

@@ -44,6 +44,57 @@ async def auth_ping():
     }
 
 
+@router.get("/diag")
+async def auth_diagnostics():
+    """
+    Diagnostic endpoint for auth configuration debugging.
+    Returns masked key information and timeout configuration.
+    """
+    import os
+    import httpx
+    
+    # Get key values
+    publishable_key = os.getenv('SUPABASE_PUBLISHABLE_KEY', '')
+    anon_key = os.getenv('SUPABASE_ANON_KEY', '')
+    service_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+    
+    # Mask keys for security
+    def mask_key(key: str) -> str:
+        if not key:
+            return "NOT_SET"
+        if len(key) < 20:
+            return "INVALID_LENGTH"
+        # Check if it's a JWT (has 3 parts separated by dots)
+        parts = key.split('.')
+        if len(parts) == 3:
+            return f"JWT_{key[:10]}...{key[-10:]}"
+        else:
+            return f"KEY_{key[:10]}...{key[-10:]}"
+    
+    return {
+        "status": "diagnostic",
+        "keys": {
+            "publishable_key": mask_key(publishable_key),
+            "anon_key": mask_key(anon_key),
+            "service_key": mask_key(service_key),
+            "key_type_used": "publishable" if publishable_key else "anon"
+        },
+        "timeout_config": {
+            "connect": "3.0s",
+            "read": "8.0s",
+            "write": "2.0s",
+            "pool": "1.0s",
+            "asyncio_wrap": "8.5s"
+        },
+        "http_config": {
+            "http2": False,
+            "max_connections": 100,
+            "keepalive_connections": 20
+        },
+        "supabase_url": os.getenv('SUPABASE_URL', 'NOT_SET')
+    }
+
+
 @router.post("/validate")
 async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
