@@ -59,7 +59,8 @@ class AsyncAuthService:
                 "Authorization": f"Bearer {auth_key}",
                 "Content-Type": "application/json"
             },
-            http2=False  # Disable HTTP/2 for better compatibility with Supabase
+            http2=False,  # Disable HTTP/2 for better compatibility with Supabase
+            http1=True    # Force HTTP/1.1 for Supabase compatibility
         )
         
         # Service client for database operations
@@ -74,7 +75,8 @@ class AsyncAuthService:
                 "Content-Type": "application/json",
                 "Prefer": "return=representation"
             },
-            http2=False  # Disable HTTP/2 for better compatibility
+            http2=False,  # Disable HTTP/2 for better compatibility
+            http1=True    # Force HTTP/1.1
         )
         
         logger.info(f"✅ [ASYNC-AUTH] Initialized with production timeouts (connect={self.timeout.connect}s, read={self.timeout.read}s, write={self.timeout.write}s, pool={self.timeout.pool}s)")
