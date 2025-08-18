@@ -1,0 +1,135 @@
+# Railway-optimized .dockerignore for FastAPI backend
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+velro-backend/
+
+# Development and testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+pytest.ini
+test-reports/
+*.log
+*.txt
+token.txt
+
+# Development tools
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+*.md
+!requirements.txt
+
+# Configuration (use environment variables instead)
+.env
+.env.*
+config.json
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Railway and deployment
+railway.json
+.railway/
+
+# Test files
+test_*.py
+*_test.py
+tests/
+*test*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# IDE and editor files
+*.sublime-*
+.vscode/
+.idea/
+
+# Coverage reports
+.coverage
+.nyc_output
+coverage/
+
+# Dependency directories
+node_modules/
+
+# Railway-specific ignores
+.swarm/
+migrations/
+debug_*.py
+create_*.py
+apply_*.py
+comprehensive_*.py
+final_*.py
+fix_*.py
+focused_*.py
+manual_*.sql
+quick_*.py
+setup_*.py
+simple_*.py
+start_*.py
+test_*.json
+update_*.py
+validate_*.py
+*_FIXES_*.md
+*_TESTING_*.md  
+*_VALIDATION_*.md
+*_GUIDE.md
+*_REPORT.md
+*_SUMMARY.md
+*_DOCUMENTATION.md

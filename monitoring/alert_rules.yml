@@ -1,0 +1,281 @@
+# Prometheus Alert Rules for UUID Authorization System
+# Production-ready alerting for performance, security, and compliance monitoring
+
+groups:
+  - name: authorization_performance
+    rules:
+      # Sub-100ms authorization SLA violation
+      - alert: AuthorizationSLAViolation
+        expr: increase(velro_auth_sla_violations_total[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+          service: authorization
+          sla: sub_100ms
+        annotations:
+          summary: "Authorization SLA violations detected"
+          description: "{{ $value }} authorization requests exceeded 100ms SLA in the last 5 minutes"
+          runbook_url: "https://docs.velro.com/runbooks/auth-sla-violation"
+
+      # High authorization failure rate
+      - alert: HighAuthorizationFailureRate
+        expr: rate(velro_auth_failures_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          service: authorization
+        annotations:
+          summary: "High authorization failure rate detected"
+          description: "Authorization failure rate is {{ $value }} failures per second over the last 5 minutes"
+          impact: "Users may be unable to access resources"
+
+      # Authorization response time P95 exceeding target
+      - alert: AuthorizationSlowP95
+        expr: histogram_quantile(0.95, rate(velro_auth_duration_seconds_bucket[5m])) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          service: authorization
+        annotations:
+          summary: "Authorization P95 response time too high"
+          description: "95th percentile authorization response time is {{ $value }}s (target: 50ms)"
+
+      # Concurrent authorization requests overload
+      - alert: HighConcurrentAuthRequests
+        expr: velro_concurrent_auth_requests > 1000
+        for: 1m
+        labels:
+          severity: warning
+          service: authorization
+        annotations:
+          summary: "High concurrent authorization requests"
+          description: "{{ $value }} concurrent authorization requests (threshold: 1000)"
+
+  - name: cache_performance
+    rules:
+      # Cache hit rate below target (95%)
+      - alert: LowCacheHitRate
+        expr: (rate(velro_cache_hits_total[10m]) / (rate(velro_cache_hits_total[10m]) + rate(velro_cache_misses_total[10m]))) < 0.95
+        for: 5m
+        labels:
+          severity: warning
+          service: cache
+        annotations:
+          summary: "Cache hit rate below target"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} (target: 95%)"
+          impact: "Increased database load and slower response times"
+
+      # Redis connection issues
+      - alert: RedisConnectionDown
+        expr: up{job="redis-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: cache
+        annotations:
+          summary: "Redis connection down"
+          description: "Redis cache is not responding"
+          impact: "Cache unavailable, falling back to database"
+
+      # High cache eviction rate
+      - alert: HighCacheEvictionRate
+        expr: rate(velro_cache_evictions_total[10m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          service: cache
+        annotations:
+          summary: "High cache eviction rate"
+          description: "Cache eviction rate is {{ $value }} evictions per second"
+          impact: "Frequent cache misses and potential memory pressure"
+
+      # Redis memory usage high
+      - alert: RedisMemoryUsageHigh
+        expr: velro_redis_memory_usage_bytes{type="used"} / velro_redis_memory_usage_bytes{type="peak"} > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: cache
+        annotations:
+          summary: "Redis memory usage high"
+          description: "Redis memory usage is {{ $value | humanizePercentage }} of peak"
+
+  - name: security_monitoring
+    rules:
+      # High security violation rate
+      - alert: HighSecurityViolationRate
+        expr: rate(velro_security_violations_total[5m]) > 5
+        for: 1m
+        labels:
+          severity: critical
+          service: security
+        annotations:
+          summary: "High security violation rate detected"
+          description: "{{ $value }} security violations per second detected"
+          impact: "Potential security attack in progress"
+          action_required: "Investigate immediately and consider IP blocking"
+
+      # Repeated failed login attempts
+      - alert: BruteForceAttack
+        expr: rate(velro_failed_logins_total[5m]) by (source_ip) > 10
+        for: 2m
+        labels:
+          severity: critical
+          service: security
+        annotations:
+          summary: "Potential brute force attack detected"
+          description: "{{ $value }} failed login attempts per second from IP {{ $labels.source_ip }}"
+          action_required: "Block source IP immediately"
+
+      # Rate limit violations
+      - alert: HighRateLimitViolations
+        expr: rate(velro_rate_limit_hits_total[5m]) > 50
+        for: 3m
+        labels:
+          severity: warning
+          service: security
+        annotations:
+          summary: "High rate limit violations"
+          description: "{{ $value }} rate limit violations per second"
+          impact: "Potential API abuse or DDoS attack"
+
+      # Suspicious activity patterns
+      - alert: SuspiciousActivityDetected
+        expr: rate(velro_suspicious_patterns_total[10m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: security
+        annotations:
+          summary: "Suspicious activity patterns detected"
+          description: "{{ $value }} suspicious patterns per second detected"
+
+      # JWT validation failures
+      - alert: HighJWTValidationFailures
+        expr: rate(velro_jwt_validations_total{result="failure"}[5m]) > 2
+        for: 3m
+        labels:
+          severity: warning
+          service: security
+        annotations:
+          summary: "High JWT validation failure rate"
+          description: "{{ $value }} JWT validation failures per second"
+
+  - name: application_health
+    rules:
+      # Application down
+      - alert: VelroBackendDown
+        expr: up{job="velro-backend"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: application
+        annotations:
+          summary: "Velro backend application is down"
+          description: "The main application is not responding to health checks"
+          impact: "Complete service outage"
+
+      # High error rate
+      - alert: HighHTTPErrorRate
+        expr: rate(velro_http_requests_total{status_code=~"5.."}[5m]) / rate(velro_http_requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: critical
+          service: application
+        annotations:
+          summary: "High HTTP error rate"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors"
+
+      # Slow response times
+      - alert: SlowResponseTimes
+        expr: histogram_quantile(0.95, rate(velro_http_request_duration_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          service: application
+        annotations:
+          summary: "Slow response times detected"
+          description: "95th percentile response time is {{ $value }}s (threshold: 2s)"
+
+      # Database connection issues
+      - alert: DatabaseConnectionLow
+        expr: velro_db_connections_active < 5
+        for: 2m
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Low database connection count"
+          description: "Only {{ $value }} active database connections"
+
+      # Slow database queries
+      - alert: SlowDatabaseQueries
+        expr: histogram_quantile(0.95, rate(velro_db_query_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Slow database queries detected"
+          description: "95th percentile database query time is {{ $value }}s"
+
+  - name: system_resources
+    rules:
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: velro_cpu_usage_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is {{ $value }}%"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: velro_memory_usage_bytes{type="rss"} / (1024*1024*1024) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value }}GB"
+
+      # Disk space low (if monitoring disk usage)
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: system
+        annotations:
+          summary: "Low disk space"
+          description: "Disk usage is above 90%"
+
+  - name: compliance_monitoring
+    rules:
+      # Missing audit logs
+      - alert: AuditLogMissing
+        expr: increase(audit_events_total[1h]) == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: compliance
+        annotations:
+          summary: "No audit events recorded"
+          description: "No audit events have been recorded in the last hour"
+          compliance_impact: "Audit trail may be incomplete"
+
+      # Data access without authorization check
+      - alert: UnauthorizedDataAccess
+        expr: increase(data_access_total[5m]) > increase(authorization_checks_total[5m])
+        for: 2m
+        labels:
+          severity: critical
+          service: compliance
+        annotations:
+          summary: "Data access without proper authorization"
+          description: "Data access operations exceed authorization checks"
+          compliance_impact: "Potential GDPR/SOC2 violation"

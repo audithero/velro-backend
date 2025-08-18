@@ -1,0 +1,339 @@
+name: Credit Processing Fix Validation
+
+on:
+  push:
+    branches: [ main, development ]
+    paths:
+      - 'services/credit_transaction_service.py'
+      - 'services/generation_service.py'
+      - 'repositories/user_repository.py'
+      - 'config.py'
+      - 'tests/test_comprehensive_credit_processing_fix.py'
+      - 'tests/test_performance_credit_operations.py'
+      - '.github/workflows/credit-processing-validation.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'services/credit_transaction_service.py'
+      - 'services/generation_service.py'
+      - 'repositories/user_repository.py'
+      - 'config.py'
+      - 'tests/test_comprehensive_credit_processing_fix.py'
+      - 'tests/test_performance_credit_operations.py'
+  workflow_dispatch:
+    inputs:
+      test_phase:
+        description: 'Test phase to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - pre_fix
+          - service_key
+          - pipeline
+          - edge_cases
+          - production
+          - performance
+      verbose:
+        description: 'Enable verbose output'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: "3.9"
+  AFFECTED_USER_ID: "22cb3917-57f6-49c6-ac96-ec266570081b"
+  EXPECTED_CREDITS: 1200
+
+jobs:
+  validate-environment:
+    name: "Validate Test Environment"
+    runs-on: ubuntu-latest
+    outputs:
+      can-run-tests: ${{ steps.check-secrets.outputs.can-run-tests }}
+      test-phase: ${{ steps.set-phase.outputs.test-phase }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        id: check-secrets
+        run: |
+          if [[ -n "${{ secrets.SUPABASE_URL }}" && \
+                -n "${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" && \
+                -n "${{ secrets.SUPABASE_ANON_KEY }}" && \
+                -n "${{ secrets.FAL_KEY }}" ]]; then
+            echo "can-run-tests=true" >> $GITHUB_OUTPUT
+            echo "✅ All required secrets are available"
+          else
+            echo "can-run-tests=false" >> $GITHUB_OUTPUT
+            echo "❌ Missing required secrets for testing"
+            echo "Required: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY, FAL_KEY"
+          fi
+
+      - name: Set test phase
+        id: set-phase
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "test-phase=${{ github.event.inputs.test_phase }}" >> $GITHUB_OUTPUT
+          else
+            echo "test-phase=all" >> $GITHUB_OUTPUT
+          fi
+
+  comprehensive-credit-tests:
+    name: "Comprehensive Credit Processing Tests"
+    needs: validate-environment
+    runs-on: ubuntu-latest
+    if: needs.validate-environment.outputs.can-run-tests == 'true'
+    timeout-minutes: 30
+    
+    strategy:
+      matrix:
+        test-phase:
+          - pre_fix
+          - service_key  
+          - pipeline
+          - edge_cases
+          - production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Set up environment variables
+        run: |
+          echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
+          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          echo "SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" >> $GITHUB_ENV
+          echo "FAL_KEY=${{ secrets.FAL_KEY }}" >> $GITHUB_ENV
+          echo "DEBUG=false" >> $GITHUB_ENV
+          echo "TESTING=true" >> $GITHUB_ENV
+
+      - name: Run specific test phase - ${{ matrix.test-phase }}
+        run: |
+          if [[ "${{ github.event.inputs.verbose }}" == "true" ]]; then
+            VERBOSE_FLAG="--verbose"
+          else
+            VERBOSE_FLAG=""
+          fi
+          
+          python run_credit_processing_tests.py \
+            --phase ${{ matrix.test-phase }} \
+            --save-results \
+            $VERBOSE_FLAG
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: credit-processing-test-results-${{ matrix.test-phase }}
+          path: test-results/
+          retention-days: 30
+
+  performance-tests:
+    name: "Credit Operations Performance Tests"
+    needs: validate-environment
+    runs-on: ubuntu-latest
+    if: needs.validate-environment.outputs.can-run-tests == 'true'
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio psutil
+
+      - name: Set up environment variables
+        run: |
+          echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
+          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          echo "SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" >> $GITHUB_ENV
+          echo "FAL_KEY=${{ secrets.FAL_KEY }}" >> $GITHUB_ENV
+
+      - name: Run performance tests
+        run: |
+          python -m pytest tests/test_performance_credit_operations.py \
+            -v \
+            --tb=short \
+            -m performance
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: performance-test-results
+          path: credit_operations_performance_results.json
+          retention-days: 30
+
+  all-phases-integration:
+    name: "All Phases Integration Test"
+    needs: [comprehensive-credit-tests, performance-tests]
+    runs-on: ubuntu-latest
+    if: |
+      always() && 
+      needs.validate-environment.outputs.can-run-tests == 'true' &&
+      (needs.validate-environment.outputs.test-phase == 'all' || github.event_name != 'workflow_dispatch')
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx psutil
+
+      - name: Set up environment variables
+        run: |
+          echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
+          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          echo "SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" >> $GITHUB_ENV
+          echo "FAL_KEY=${{ secrets.FAL_KEY }}" >> $GITHUB_ENV
+
+      - name: Run comprehensive test suite
+        run: |
+          python run_credit_processing_tests.py \
+            --phase all \
+            --save-results \
+            --verbose
+
+      - name: Parse test results
+        id: parse-results
+        run: |
+          if [[ -f "test-results/credit_processing_test_results_*.json" ]]; then
+            RESULT_FILE=$(ls test-results/credit_processing_test_results_*.json | head -1)
+            OVERALL_STATUS=$(python -c "
+            import json
+            with open('$RESULT_FILE') as f:
+                data = json.load(f)
+                print(data.get('overall_status', 'UNKNOWN'))
+            ")
+            PROFILE_RESOLVED=$(python -c "
+            import json
+            with open('$RESULT_FILE') as f:
+                data = json.load(f)
+                print(data.get('summary', {}).get('profile_error_resolved', False))
+            ")
+            SUCCESS_RATE=$(python -c "
+            import json
+            with open('$RESULT_FILE') as f:
+                data = json.load(f)
+                print(data.get('summary', {}).get('success_rate', 0))
+            ")
+            
+            echo "overall-status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+            echo "profile-resolved=$PROFILE_RESOLVED" >> $GITHUB_OUTPUT
+            echo "success-rate=$SUCCESS_RATE" >> $GITHUB_OUTPUT
+            
+            echo "Test Results Summary:"
+            echo "Overall Status: $OVERALL_STATUS"
+            echo "Profile Error Resolved: $PROFILE_RESOLVED"
+            echo "Success Rate: $SUCCESS_RATE%"
+          else
+            echo "overall-status=ERROR" >> $GITHUB_OUTPUT
+            echo "profile-resolved=false" >> $GITHUB_OUTPUT
+            echo "success-rate=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload comprehensive results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: comprehensive-test-results
+          path: test-results/
+          retention-days: 30
+
+      - name: Set exit status
+        run: |
+          if [[ "${{ steps.parse-results.outputs.overall-status }}" == "PASS" ]]; then
+            echo "✅ All tests passed - Credit processing issue is RESOLVED!"
+            exit 0
+          elif [[ "${{ steps.parse-results.outputs.profile-resolved }}" == "True" ]]; then
+            echo "⚠️ Profile error resolved but some tests failed - Manual review needed"
+            exit 1
+          else
+            echo "❌ Tests failed - Credit processing issue still exists"
+            exit 2
+          fi
+
+  notify-results:
+    name: "Notify Test Results"
+    needs: [all-phases-integration]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Create test summary
+        run: |
+          echo "## 🧪 Credit Processing Fix Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Affected User:** \`${{ env.AFFECTED_USER_ID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Expected Credits:** ${{ env.EXPECTED_CREDITS }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Issue:** Credit processing failed: Profile lookup error" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.all-phases-integration.result }}" == "success" ]]; then
+            echo "### ✅ VALIDATION SUCCESSFUL" >> $GITHUB_STEP_SUMMARY
+            echo "The credit processing fix has been validated and is working correctly." >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.all-phases-integration.result }}" == "failure" ]]; then
+            echo "### ⚠️ PARTIAL SUCCESS" >> $GITHUB_STEP_SUMMARY
+            echo "The profile lookup error may be resolved but some tests failed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ VALIDATION FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "The credit processing issue has not been resolved." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Artifacts:** Check the workflow artifacts for detailed results." >> $GITHUB_STEP_SUMMARY
+
+  cleanup:
+    name: "Cleanup Test Environment"
+    needs: [all-phases-integration]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Cleanup test data
+        run: |
+          echo "🧹 Cleaning up test environment..."
+          echo "Note: In a real environment, this would clean up any test data created during testing"
+          echo "✅ Cleanup completed"

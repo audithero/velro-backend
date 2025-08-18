@@ -1,0 +1,240 @@
+# Prometheus Recording Rules for Performance Optimization
+# Pre-computed metrics for faster dashboard queries and analysis
+
+groups:
+  - name: authorization_performance_aggregation
+    interval: 30s
+    rules:
+      # Authorization request rate by endpoint
+      - record: velro:auth_request_rate_5m
+        expr: rate(velro_auth_requests_total[5m])
+        labels:
+          service: authorization
+
+      # Authorization success rate
+      - record: velro:auth_success_rate_5m
+        expr: rate(velro_auth_requests_total{status="success"}[5m]) / rate(velro_auth_requests_total[5m])
+        labels:
+          service: authorization
+
+      # Authorization failure rate by reason
+      - record: velro:auth_failure_rate_5m_by_reason
+        expr: rate(velro_auth_failures_total[5m]) by (reason)
+        labels:
+          service: authorization
+
+      # Authorization P95 response time
+      - record: velro:auth_p95_duration_5m
+        expr: histogram_quantile(0.95, rate(velro_auth_duration_seconds_bucket[5m]))
+        labels:
+          service: authorization
+
+      # Authorization P99 response time
+      - record: velro:auth_p99_duration_5m
+        expr: histogram_quantile(0.99, rate(velro_auth_duration_seconds_bucket[5m]))
+        labels:
+          service: authorization
+
+      # Average authorization response time
+      - record: velro:auth_avg_duration_5m
+        expr: rate(velro_auth_duration_seconds_sum[5m]) / rate(velro_auth_duration_seconds_count[5m])
+        labels:
+          service: authorization
+
+      # SLA compliance rate (sub-100ms)
+      - record: velro:auth_sla_compliance_rate_5m
+        expr: 1 - (rate(velro_auth_sla_violations_total[5m]) / rate(velro_auth_requests_total[5m]))
+        labels:
+          service: authorization
+
+  - name: cache_performance_aggregation
+    interval: 30s
+    rules:
+      # Cache hit rate overall
+      - record: velro:cache_hit_rate_5m
+        expr: rate(velro_cache_hits_total[5m]) / (rate(velro_cache_hits_total[5m]) + rate(velro_cache_misses_total[5m]))
+        labels:
+          service: cache
+
+      # Cache hit rate by cache type
+      - record: velro:cache_hit_rate_5m_by_cache
+        expr: rate(velro_cache_hits_total[5m]) by (cache_name) / (rate(velro_cache_hits_total[5m]) by (cache_name) + rate(velro_cache_misses_total[5m]) by (cache_name))
+        labels:
+          service: cache
+
+      # Cache operation rate
+      - record: velro:cache_ops_rate_5m
+        expr: rate(velro_cache_operations_total[5m])
+        labels:
+          service: cache
+
+      # Cache eviction rate
+      - record: velro:cache_eviction_rate_5m
+        expr: rate(velro_cache_evictions_total[5m])
+        labels:
+          service: cache
+
+      # Average cache operation duration
+      - record: velro:cache_avg_duration_5m
+        expr: rate(velro_cache_operation_duration_seconds_sum[5m]) / rate(velro_cache_operation_duration_seconds_count[5m])
+        labels:
+          service: cache
+
+      # Redis memory utilization
+      - record: velro:redis_memory_utilization
+        expr: velro_redis_memory_usage_bytes{type="used"} / velro_redis_memory_usage_bytes{type="peak"}
+        labels:
+          service: cache
+
+  - name: security_aggregation
+    interval: 30s
+    rules:
+      # Security violation rate
+      - record: velro:security_violation_rate_5m
+        expr: rate(velro_security_violations_total[5m])
+        labels:
+          service: security
+
+      # Failed authentication rate
+      - record: velro:failed_auth_rate_5m
+        expr: rate(velro_failed_logins_total[5m])
+        labels:
+          service: security
+
+      # Rate limit violation rate
+      - record: velro:rate_limit_violation_rate_5m
+        expr: rate(velro_rate_limit_hits_total[5m])
+        labels:
+          service: security
+
+      # JWT validation success rate
+      - record: velro:jwt_validation_success_rate_5m
+        expr: rate(velro_jwt_validations_total{result="success"}[5m]) / rate(velro_jwt_validations_total[5m])
+        labels:
+          service: security
+
+      # Blocked requests rate
+      - record: velro:blocked_requests_rate_5m
+        expr: rate(velro_blocked_requests_total[5m])
+        labels:
+          service: security
+
+      # Suspicious activity rate
+      - record: velro:suspicious_activity_rate_5m
+        expr: rate(velro_suspicious_patterns_total[5m])
+        labels:
+          service: security
+
+  - name: application_performance_aggregation
+    interval: 30s
+    rules:
+      # HTTP request rate by endpoint
+      - record: velro:http_request_rate_5m
+        expr: rate(velro_http_requests_total[5m])
+        labels:
+          service: application
+
+      # HTTP error rate
+      - record: velro:http_error_rate_5m
+        expr: rate(velro_http_requests_total{status_code=~"5.."}[5m]) / rate(velro_http_requests_total[5m])
+        labels:
+          service: application
+
+      # HTTP P95 response time
+      - record: velro:http_p95_duration_5m
+        expr: histogram_quantile(0.95, rate(velro_http_request_duration_seconds_bucket[5m]))
+        labels:
+          service: application
+
+      # HTTP P99 response time
+      - record: velro:http_p99_duration_5m
+        expr: histogram_quantile(0.99, rate(velro_http_request_duration_seconds_bucket[5m]))
+        labels:
+          service: application
+
+      # Database query rate
+      - record: velro:db_query_rate_5m
+        expr: rate(velro_db_query_duration_seconds_count[5m])
+        labels:
+          service: database
+
+      # Database P95 query time
+      - record: velro:db_p95_duration_5m
+        expr: histogram_quantile(0.95, rate(velro_db_query_duration_seconds_bucket[5m]))
+        labels:
+          service: database
+
+      # Database connection utilization
+      - record: velro:db_connection_utilization
+        expr: velro_db_connections_active / (velro_db_connections_active + velro_db_connections_idle)
+        labels:
+          service: database
+
+  - name: uuid_validation_aggregation
+    interval: 30s
+    rules:
+      # UUID validation rate
+      - record: velro:uuid_validation_rate_5m
+        expr: rate(velro_uuid_validations_total[5m])
+        labels:
+          service: uuid_validation
+
+      # UUID validation success rate
+      - record: velro:uuid_validation_success_rate_5m
+        expr: rate(velro_uuid_validations_total{status="success"}[5m]) / rate(velro_uuid_validations_total[5m])
+        labels:
+          service: uuid_validation
+
+      # UUID validation average duration
+      - record: velro:uuid_validation_avg_duration_5m
+        expr: rate(velro_uuid_validation_duration_seconds_sum[5m]) / rate(velro_uuid_validation_duration_seconds_count[5m])
+        labels:
+          service: uuid_validation
+
+  - name: business_metrics_aggregation
+    interval: 60s
+    rules:
+      # Active user sessions
+      - record: velro:active_sessions_current
+        expr: velro_active_sessions
+        labels:
+          service: application
+
+      # Generation access rate
+      - record: velro:generation_access_rate_5m
+        expr: rate(velro_auth_requests_total{endpoint=~".*generation.*"}[5m])
+        labels:
+          service: business
+
+      # Generation access success rate
+      - record: velro:generation_access_success_rate_5m
+        expr: rate(velro_auth_requests_total{endpoint=~".*generation.*",status="success"}[5m]) / rate(velro_auth_requests_total{endpoint=~".*generation.*"}[5m])
+        labels:
+          service: business
+
+      # Media URL generation rate
+      - record: velro:media_url_generation_rate_5m
+        expr: rate(velro_auth_requests_total{endpoint=~".*media.*"}[5m])
+        labels:
+          service: business
+
+  - name: compliance_metrics_aggregation
+    interval: 60s
+    rules:
+      # Audit event rate
+      - record: velro:audit_event_rate_5m
+        expr: rate(audit_events_total[5m])
+        labels:
+          service: compliance
+
+      # Data access without authorization rate
+      - record: velro:unauthorized_data_access_rate_5m
+        expr: rate(data_access_total[5m]) - rate(authorization_checks_total[5m])
+        labels:
+          service: compliance
+
+      # GDPR compliance score (example calculation)
+      - record: velro:gdpr_compliance_score
+        expr: min(velro:audit_event_rate_5m > 0, velro:auth_success_rate_5m > 0.99)
+        labels:
+          service: compliance
