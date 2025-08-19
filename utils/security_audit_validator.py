@@ -152,6 +152,10 @@ class SecurityAuditValidator:
             incident_id: Unique identifier for the incident
         """
         try:
+            # CRITICAL FIX: Filter out Railway infrastructure to prevent log flood during deployment
+            if self._is_railway_infrastructure(client_ip, user_agent, request_path):
+                # Silently handle Railway infrastructure without logging to prevent rate limit
+                return "railway_infrastructure_filtered"
             # Convert string to enum if needed
             if isinstance(incident_type, str):
                 try:
@@ -630,6 +634,65 @@ class SecurityAuditValidator:
             recommendations.append("OWASP Top 10 2021 compliance is satisfactory.")
         
         return recommendations
+    
+    def _is_railway_infrastructure(self, client_ip: Optional[str], user_agent: Optional[str], request_path: Optional[str]) -> bool:
+        """
+        Check if request is from Railway infrastructure to prevent log flood during deployment.
+        
+        Railway infrastructure includes:
+        - Health checkers during deployment
+        - Internal load balancers
+        - Platform monitoring systems
+        """
+        if not client_ip:
+            return False
+        
+        # Railway infrastructure IP ranges (100.64.0.0/10 is used by Railway for internal services)
+        railway_ip_ranges = [
+            '100.64.',  # Railway internal network range
+            '10.',      # Private network (Railway load balancers)
+            '172.16.',  # Docker internal network
+            '172.17.',  # Docker internal network
+            '127.0.0.1', # localhost (Railway container health checks)
+        ]
+        
+        # Check if IP is from Railway infrastructure
+        for ip_prefix in railway_ip_ranges:
+            if client_ip.startswith(ip_prefix):
+                return True
+        
+        # Check for Railway specific user agents (health checkers, etc.)
+        if user_agent:
+            railway_user_agents = [
+                'railway',
+                'health-check',
+                'load-balancer',
+                'internal-monitoring',
+                'railway-proxy',
+                'railway-lb',
+                'deployment-health'
+            ]
+            
+            user_agent_lower = user_agent.lower()
+            for agent in railway_user_agents:
+                if agent in user_agent_lower:
+                    return True
+        
+        # Check for health check paths that Railway uses
+        if request_path:
+            railway_health_paths = [
+                '/health',
+                '/healthz',
+                '/_health',
+                '/status',
+                '/ping'
+            ]
+            
+            for health_path in railway_health_paths:
+                if request_path.lower() == health_path:
+                    return True
+        
+        return False
 
 
 # Global security audit validator instance

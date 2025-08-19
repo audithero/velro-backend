@@ -130,17 +130,32 @@ class AccessControlMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         """Apply comprehensive access control checks to all requests."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         
         path = request.url.path
         method = request.method
         
         try:
-            # PERFORMANCE: Skip heavy access control for fastpath endpoints
-            from middleware.utils import is_fastpath, log_middleware_skip
-            if is_fastpath(request):
-                log_middleware_skip(request, "access_control", "fastpath_bypass")
+            # OPTIONS requests must pass through for CORS preflight
+            if method == "OPTIONS":
                 return await call_next(request)
+            
+            # AGGRESSIVE AUTH BYPASS: Skip all access control for auth endpoints
+            if path.startswith('/api/v1/auth/'):
+                return await call_next(request)
+            
+            # CRITICAL: Check for fastlane flag first
+            if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+                return await call_next(request)
+            
+            # PERFORMANCE: Skip heavy access control for fastpath endpoints
+            try:
+                from middleware.utils import is_fastpath, log_middleware_skip
+                if is_fastpath(request):
+                    log_middleware_skip(request, "access_control", "fastpath_bypass")
+                    return await call_next(request)
+            except ImportError:
+                pass  # utils module may not exist
             
             # Skip access control for public endpoints and health checks
             if self._is_public_endpoint(path):
@@ -212,9 +227,17 @@ class AccessControlMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             
             # Log completion time for performance monitoring
-            processing_time = (time.time() - start_time) * 1000
-            from middleware.utils import log_middleware_timing
-            log_middleware_timing(request, "access_control", processing_time)
+            processing_time = (time.perf_counter() - start_time) * 1000
+            try:
+                from middleware.utils import log_middleware_timing
+                log_middleware_timing(request, "access_control", processing_time)
+            except ImportError:
+                pass  # utils module may not exist
+            
+            # PERFORMANCE: Add timing logs for slow processing
+            if processing_time > 10:  # Log if >10ms
+                logger.warning(f"[MIDDLEWARE] AccessControl took {processing_time:.2f}ms")
+            
             logger.debug(f"✅ [ACCESS-CONTROL] {method} {path} completed in {processing_time:.2f}ms")
             
             return response
@@ -234,6 +257,7 @@ class AccessControlMiddleware(BaseHTTPMiddleware):
         public_endpoints = {
             "/", "/health", "/docs", "/redoc", "/openapi.json",
             "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/refresh",
+            "/api/v1/auth/__fastlane_flags", "/api/v1/auth/diag",  # Auth diagnostic endpoints
             "/api/v1/generations/models/supported"  # Public models list
         }
         
@@ -242,7 +266,11 @@ class AccessControlMiddleware(BaseHTTPMiddleware):
             return True
             
         # Check prefixes for endpoints that don't need access control
-        public_prefixes = ["/api/v1/debug/", "/api/v1/e2e/"]  # E2E testing endpoints
+        public_prefixes = [
+            "/api/v1/auth/",  # ALL auth endpoints are public
+            "/api/v1/debug/", 
+            "/api/v1/e2e/"
+        ]  # E2E testing endpoints
         if any(path.startswith(prefix) for prefix in public_prefixes):
             # Debug endpoints only in development
             if path.startswith("/api/v1/debug/"):

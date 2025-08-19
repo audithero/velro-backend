@@ -574,12 +574,13 @@ async def get_generation_media_urls(
 
 @router.get("/models/supported/")
 @router.get("/models/supported")  # CRITICAL FIX: Add route without trailing slash
-# @limit("20/minute")  # Moderate limit for model info - temporarily disabled for testing
+# NOTE: No authentication required - this is a public endpoint for frontend to load models
 async def get_supported_models(request: Request):
     """
     Get all supported AI models with their configurations.
     
-    Rate limit: 20 requests per minute for model information.
+    PUBLIC ENDPOINT - No authentication required.
+    This endpoint is called by frontend before user logs in to populate model dropdown.
     """
     import logging
     logger = logging.getLogger(__name__)

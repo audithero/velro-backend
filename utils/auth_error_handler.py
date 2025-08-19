@@ -475,7 +475,7 @@ class AuthorizationErrorHandler:
             'success': False,
             'strategy': RecoveryStrategy.REQUEST_PERMISSIONS.value,
             'user_action': 'request_permissions',
-            'message': 'You don\\'t have sufficient permissions. Request access from an administrator.',
+            'message': "You don't have sufficient permissions. Request access from an administrator.",
             'support_info': {
                 'required_permissions': getattr(error, 'required_permission', 'unknown'),
                 'current_role': context.user_id,  # Would need to fetch actual role

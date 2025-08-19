@@ -16,9 +16,44 @@ import asyncio
 import threading
 from contextlib import contextmanager
 from enum import Enum
+import backoff
+import random
 
 from monitoring.metrics import metrics_collector
 from config import settings
+
+# Check if backoff is available, provide fallback if not
+try:
+    import backoff
+except ImportError:
+    logger.warning("backoff package not available, using simple retry logic")
+    # Simple fallback decorator
+    class SimpleBackoff:
+        @staticmethod
+        def on_exception(wait_gen, exception, max_tries=3, max_time=5, jitter=None):
+            def decorator(func):
+                def wrapper(*args, **kwargs):
+                    for attempt in range(max_tries):
+                        try:
+                            return func(*args, **kwargs)
+                        except exception as e:
+                            if attempt == max_tries - 1:
+                                raise
+                            import time
+                            time.sleep(min(2 ** attempt + random.random(), max_time / max_tries))
+                    return func(*args, **kwargs)
+                return wrapper
+            return decorator
+        
+        @staticmethod
+        def expo(*args, **kwargs):
+            return None
+        
+        @staticmethod 
+        def random_jitter(*args, **kwargs):
+            return None
+    
+    backoff = SimpleBackoff()
 
 logger = logging.getLogger(__name__)
 
@@ -82,17 +117,16 @@ class RedisCache:
         self.key_prefix = key_prefix
         self.default_ttl = default_ttl
         self.compression_enabled = compression_enabled
+        self.max_connections = max_connections
         
-        # Redis connection with connection pooling
-        self.connection_pool = redis.ConnectionPool.from_url(
-            self.redis_url,
-            max_connections=max_connections,
-            retry_on_timeout=True,
-            socket_keepalive=True,
-            socket_keepalive_options={}
-        )
+        # Redis connection state tracking
+        self._redis_available = False
+        self._last_connection_attempt = 0
+        self._connection_retry_interval = 30  # seconds
+        self._max_retries = 3
         
-        self.redis_client = redis.Redis(connection_pool=self.connection_pool)
+        # Initialize Redis connection pool
+        self._initialize_redis_pool()
         
         # Local memory cache for frequently accessed items
         self._memory_cache: Dict[str, CacheEntry] = {}
@@ -105,21 +139,79 @@ class RedisCache:
             'misses': 0,
             'sets': 0,
             'deletes': 0,
-            'errors': 0
+            'errors': 0,
+            'redis_failures': 0,
+            'memory_fallbacks': 0
         }
         self._stats_lock = threading.Lock()
-        
-        # Health check
-        self._test_connection()
     
-    def _test_connection(self):
-        """Test Redis connection on initialization."""
+    def _initialize_redis_pool(self):
+        """Initialize Redis connection pool with optimized parameters."""
         try:
-            self.redis_client.ping()
-            logger.info(f"✅ Redis cache connected to {self.redis_url}")
+            # Enhanced connection pool configuration
+            self.connection_pool = redis.ConnectionPool.from_url(
+                self.redis_url,
+                max_connections=self.max_connections,
+                retry_on_timeout=True,
+                retry_on_error=[redis.ConnectionError, redis.TimeoutError],
+                socket_keepalive=True,
+                socket_keepalive_options={
+                    1: 1,  # TCP_KEEPIDLE
+                    2: 3,  # TCP_KEEPINTVL 
+                    3: 5,  # TCP_KEEPCNT
+                },
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                health_check_interval=30
+            )
+            
+            self.redis_client = redis.Redis(
+                connection_pool=self.connection_pool,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                retry_on_timeout=True,
+                retry_on_error=[redis.ConnectionError, redis.TimeoutError],
+                retry=redis.Retry(retries=2)
+            )
+            
+            # Test initial connection
+            self._test_connection()
+            
         except Exception as e:
-            logger.error(f"❌ Redis cache connection failed: {e}")
-            raise ConnectionError(f"Failed to connect to Redis: {e}")
+            logger.error(f"❌ Redis pool initialization failed: {e}")
+            logger.info("🔄 Redis cache will use memory-only fallback")
+            self._redis_available = False
+            self.redis_client = None
+    
+    @backoff.on_exception(
+        backoff.expo,
+        (redis.ConnectionError, redis.TimeoutError),
+        max_tries=3,
+        max_time=5,
+        jitter=backoff.random_jitter
+    )
+    def _test_connection(self):
+        """Test Redis connection with exponential backoff retry."""
+        try:
+            if self.redis_client:
+                result = self.redis_client.ping()
+                if result:
+                    logger.info(f"✅ Redis cache connected to {self.redis_url}")
+                    self._redis_available = True
+                    self._last_connection_attempt = time.time()
+                    return True
+            
+            raise redis.ConnectionError("Redis ping failed")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Redis connection test failed: {e}")
+            self._redis_available = False
+            self._last_connection_attempt = time.time()
+            
+            # Only raise on first initialization, otherwise fall back gracefully
+            if not hasattr(self, '_stats'):
+                logger.error("🔄 Redis cache will use memory-only fallback")
+            return False
     
     def _make_key(self, key: str) -> str:
         """Create prefixed cache key."""
@@ -167,6 +259,45 @@ class RedisCache:
             if operation in self._stats:
                 self._stats[operation] += 1
     
+    def _should_retry_redis(self) -> bool:
+        """Check if we should retry Redis connection."""
+        if self._redis_available:
+            return True
+        
+        # Retry connection attempt if enough time has passed
+        current_time = time.time()
+        if current_time - self._last_connection_attempt > self._connection_retry_interval:
+            try:
+                if self._test_connection():
+                    logger.info("🔄 Redis connection restored")
+                    return True
+            except Exception as e:
+                logger.debug(f"Redis reconnection attempt failed: {e}")
+        
+        return False
+    
+    def _execute_redis_operation(self, operation_func, fallback_result=None):
+        """Execute Redis operation with fallback to memory cache."""
+        if not self._should_retry_redis():
+            self._update_stats('memory_fallbacks')
+            return fallback_result
+        
+        try:
+            result = operation_func()
+            return result
+            
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.debug(f"Redis operation failed: {e}")
+            self._redis_available = False
+            self._update_stats('redis_failures')
+            self._update_stats('memory_fallbacks')
+            return fallback_result
+            
+        except Exception as e:
+            logger.error(f"Unexpected Redis error: {e}")
+            self._update_stats('errors')
+            return fallback_result
+    
     def _check_memory_cache(self, key: str) -> Optional[Any]:
         """Check L1 memory cache."""
         with self._memory_cache_lock:
@@ -203,7 +334,7 @@ class RedisCache:
     def get(self, key: str, default: Any = None) -> Any:
         """
         Get value from cache with multi-level checking.
-        First checks L1 memory cache, then L2 Redis cache.
+        First checks L1 memory cache, then L2 Redis cache with fallback.
         """
         full_key = self._make_key(key)
         start_time = time.time()
@@ -219,20 +350,29 @@ class RedisCache:
                 self._update_stats('hits')
                 return memory_value
             
-            # Check L2 Redis cache
-            redis_data = self.redis_client.get(full_key)
+            # Check L2 Redis cache with fallback handling
+            def redis_get():
+                if not self.redis_client:
+                    return None
+                return self.redis_client.get(full_key)
+            
+            redis_data = self._execute_redis_operation(redis_get)
             if redis_data is not None:
-                value = self._deserialize_value(redis_data)
-                
-                # Store in memory cache for faster future access
-                self._set_memory_cache(key, value)
-                
-                duration = time.time() - start_time
-                metrics_collector.cache_metrics.record_cache_operation(
-                    "authorization", "get", "hit", duration, "redis"
-                )
-                self._update_stats('hits')
-                return value
+                try:
+                    value = self._deserialize_value(redis_data)
+                    
+                    # Store in memory cache for faster future access
+                    self._set_memory_cache(key, value)
+                    
+                    duration = time.time() - start_time
+                    metrics_collector.cache_metrics.record_cache_operation(
+                        "authorization", "get", "hit", duration, "redis"
+                    )
+                    self._update_stats('hits')
+                    return value
+                    
+                except Exception as deser_error:
+                    logger.warning(f"Failed to deserialize Redis data for key {key}: {deser_error}")
             
             # Cache miss
             duration = time.time() - start_time
@@ -251,35 +391,52 @@ class RedisCache:
             tags: Optional[Set[str]] = None) -> bool:
         """
         Set value in cache with TTL and tag support.
-        Stores in both memory and Redis caches.
+        Stores in both memory and Redis caches with fallback handling.
         """
         full_key = self._make_key(key)
         start_time = time.time()
         ttl = ttl or self.default_ttl
         
         try:
-            # Serialize value
-            serialized_value = self._serialize_value(value)
+            # Always set in memory cache first (as fallback)
+            self._set_memory_cache(key, value, ttl)
+            memory_cache_success = True
             
-            # Set in Redis with TTL
-            success = self.redis_client.setex(full_key, ttl, serialized_value)
+            # Attempt Redis cache with fallback
+            redis_success = False
+            if self._should_retry_redis():
+                try:
+                    serialized_value = self._serialize_value(value)
+                    
+                    def redis_set():
+                        if not self.redis_client:
+                            return False
+                        return self.redis_client.setex(full_key, ttl, serialized_value)
+                    
+                    redis_result = self._execute_redis_operation(redis_set, False)
+                    if redis_result:
+                        redis_success = True
+                        
+                        # Store tags for invalidation (only if Redis succeeded)
+                        if tags:
+                            self._store_tags(key, tags)
+                
+                except Exception as e:
+                    logger.debug(f"Redis set operation failed for key {key}: {e}")
             
-            if success:
-                # Set in memory cache
-                self._set_memory_cache(key, value, ttl)
-                
-                # Store tags for invalidation
-                if tags:
-                    self._store_tags(key, tags)
-                
-                duration = time.time() - start_time
+            # Record success if either cache worked (prioritizing Redis)
+            duration = time.time() - start_time
+            if redis_success:
                 metrics_collector.cache_metrics.record_cache_operation(
-                    "authorization", "set", "success", duration
+                    "authorization", "set", "success", duration, "redis"
                 )
-                self._update_stats('sets')
-                return True
+            elif memory_cache_success:
+                metrics_collector.cache_metrics.record_cache_operation(
+                    "authorization", "set", "success", duration, "memory_fallback"
+                )
             
-            return False
+            self._update_stats('sets')
+            return redis_success or memory_cache_success
             
         except Exception as e:
             logger.error(f"Cache set error for key {key}: {e}")
@@ -292,22 +449,41 @@ class RedisCache:
         start_time = time.time()
         
         try:
-            # Remove from memory cache
+            # Remove from memory cache (always succeeds)
+            memory_deleted = False
             with self._memory_cache_lock:
-                self._memory_cache.pop(key, None)
+                if key in self._memory_cache:
+                    del self._memory_cache[key]
+                    memory_deleted = True
             
-            # Remove from Redis
-            deleted = self.redis_client.delete(full_key)
-            
-            # Clean up tags
-            self._remove_tags(key)
+            # Remove from Redis with fallback handling
+            redis_deleted = False
+            if self._should_retry_redis():
+                def redis_delete():
+                    if not self.redis_client:
+                        return 0
+                    return self.redis_client.delete(full_key)
+                
+                result = self._execute_redis_operation(redis_delete, 0)
+                redis_deleted = result > 0
+                
+                # Clean up tags (only if Redis is available)
+                if redis_deleted:
+                    try:
+                        self._remove_tags(key)
+                    except Exception as tag_error:
+                        logger.debug(f"Tag cleanup failed for key {key}: {tag_error}")
             
             duration = time.time() - start_time
-            metrics_collector.cache_metrics.record_cache_operation(
-                "authorization", "delete", "success", duration
-            )
+            success = redis_deleted or memory_deleted
+            
+            if success:
+                metrics_collector.cache_metrics.record_cache_operation(
+                    "authorization", "delete", "success", duration
+                )
+            
             self._update_stats('deletes')
-            return deleted > 0
+            return success
             
         except Exception as e:
             logger.error(f"Cache delete error for key {key}: {e}")
@@ -317,8 +493,28 @@ class RedisCache:
     def exists(self, key: str) -> bool:
         """Check if key exists in cache."""
         try:
-            full_key = self._make_key(key)
-            return self.redis_client.exists(full_key) > 0
+            # Check memory cache first
+            with self._memory_cache_lock:
+                if key in self._memory_cache:
+                    entry = self._memory_cache[key]
+                    if not entry.is_expired():
+                        return True
+                    else:
+                        # Clean up expired entry
+                        del self._memory_cache[key]
+            
+            # Check Redis with fallback
+            if self._should_retry_redis():
+                def redis_exists():
+                    if not self.redis_client:
+                        return False
+                    full_key = self._make_key(key)
+                    return self.redis_client.exists(full_key) > 0
+                
+                return self._execute_redis_operation(redis_exists, False)
+            
+            return False
+            
         except Exception as e:
             logger.error(f"Cache exists error for key {key}: {e}")
             return False
@@ -326,8 +522,25 @@ class RedisCache:
     def ttl(self, key: str) -> int:
         """Get TTL for key in seconds."""
         try:
-            full_key = self._make_key(key)
-            return self.redis_client.ttl(full_key)
+            # Check memory cache first
+            with self._memory_cache_lock:
+                if key in self._memory_cache:
+                    entry = self._memory_cache[key]
+                    if not entry.is_expired():
+                        return entry.time_to_live() or -1
+            
+            # Check Redis with fallback
+            if self._should_retry_redis():
+                def redis_ttl():
+                    if not self.redis_client:
+                        return -1
+                    full_key = self._make_key(key)
+                    return self.redis_client.ttl(full_key)
+                
+                return self._execute_redis_operation(redis_ttl, -1)
+            
+            return -1
+            
         except Exception as e:
             logger.error(f"Cache TTL error for key {key}: {e}")
             return -1
@@ -335,8 +548,27 @@ class RedisCache:
     def expire(self, key: str, ttl: int) -> bool:
         """Set new TTL for existing key."""
         try:
-            full_key = self._make_key(key)
-            return self.redis_client.expire(full_key, ttl)
+            # Update memory cache TTL
+            memory_updated = False
+            with self._memory_cache_lock:
+                if key in self._memory_cache:
+                    entry = self._memory_cache[key]
+                    entry.expires_at = datetime.utcnow() + timedelta(seconds=ttl)
+                    memory_updated = True
+            
+            # Update Redis TTL with fallback
+            redis_updated = False
+            if self._should_retry_redis():
+                def redis_expire():
+                    if not self.redis_client:
+                        return False
+                    full_key = self._make_key(key)
+                    return self.redis_client.expire(full_key, ttl)
+                
+                redis_updated = self._execute_redis_operation(redis_expire, False)
+            
+            return redis_updated or memory_updated
+            
         except Exception as e:
             logger.error(f"Cache expire error for key {key}: {e}")
             return False

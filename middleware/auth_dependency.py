@@ -10,7 +10,7 @@ from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from utils.jwt_security import verify_supabase_jwt, JWTSecurityError
-from services.auth_service import AuthService
+from services.auth_service_async import AsyncAuthService as AuthService
 from database import SupabaseClient
 from models.user import UserResponse
 

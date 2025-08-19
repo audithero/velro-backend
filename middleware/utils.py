@@ -1,47 +1,78 @@
 """
-Middleware utility functions for performance optimization.
-Provides fastpath detection and common middleware helpers.
+Middleware utility functions for performance optimization and monitoring.
+Provides fastpath detection, timing logs, and bypass coordination.
 """
+import time
 import logging
-from typing import List
+from typing import Dict, List, Optional, Any
 from fastapi import Request
 
 logger = logging.getLogger(__name__)
 
+# Auth endpoints that should use fastpath processing
+FASTPATH_PREFIXES = (
+    '/api/v1/auth/',
+    '/auth/',
+    '/api/v1/public/',
+    '/health',
+    '/metrics',
+    '/__version',
+    '/__health'
+)
+
+# Timing thresholds for different middleware (in milliseconds)
+MIDDLEWARE_TIMING_THRESHOLDS = {
+    'fastlane_auth': 5,
+    'production_optimized': 10,
+    'access_control': 15,
+    'ssrf_protection': 20,
+    'security_enhanced': 25,
+    'csrf_protection': 10,
+    'rate_limiting': 30,
+    'secure_design': 15,
+    'default': 10
+}
+
+# Global middleware performance tracking
+middleware_performance_stats = {}
+
 def is_fastpath(request: Request) -> bool:
     """
-    Check if request should use fastpath processing (skip heavy middleware).
+    Check if request should use fastpath processing.
     
-    Fastpath endpoints bypass expensive middleware operations like:
-    - Access Control validation
-    - SSRF protection scanning
-    - Heavy rate limiting checks
-    
-    Returns True if request path is in FASTPATH_EXEMPT_PATHS config.
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        True if request should use fastpath, False otherwise
     """
-    try:
-        from config import settings
-        fastpath_paths = getattr(settings, 'fastpath_exempt_paths', [])
-        
-        request_path = request.url.path
-        
-        # Check exact matches first (most common case)
-        if request_path in fastpath_paths:
-            logger.debug(f"✅ [FASTPATH] Exact match for {request_path}")
-            return True
-        
-        # Check prefix matches for parameterized endpoints
-        for exempt_path in fastpath_paths:
-            if request_path.startswith(exempt_path.rstrip("/*")):
-                logger.debug(f"✅ [FASTPATH] Prefix match for {request_path} -> {exempt_path}")
+    # Check if FastlaneAuthMiddleware marked this as fastlane
+    if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+        return True
+    
+    # Check path-based fastpath
+    path = request.url.path
+    is_fast = any(path.startswith(prefix) for prefix in FASTPATH_PREFIXES)
+    
+    if not is_fast:
+        # Check config-based fastpath
+        try:
+            from config import settings
+            fastpath_paths = getattr(settings, 'fastpath_exempt_paths', [])
+            
+            # Check exact matches first (most common case)
+            if path in fastpath_paths:
                 return True
-        
-        return False
-        
-    except Exception as e:
-        logger.warning(f"⚠️ [FASTPATH] Error checking fastpath: {e}, defaulting to full processing")
-        # Fail safe: if we can't determine fastpath, use full processing
-        return False
+            
+            # Check prefix matches for parameterized endpoints
+            for exempt_path in fastpath_paths:
+                if path.startswith(exempt_path.rstrip("/*")):
+                    return True
+                    
+        except Exception as e:
+            logger.debug(f"Config fastpath check failed: {e}")
+    
+    return is_fast
 
 def get_client_ip(request: Request) -> str:
     """
@@ -116,13 +147,124 @@ def log_middleware_skip(request: Request, middleware_name: str, reason: str):
 
 def log_middleware_timing(request: Request, middleware_name: str, duration_ms: float):
     """
-    Log middleware processing time for performance monitoring.
+    Log middleware processing time for performance monitoring and track statistics.
+    
+    Args:
+        request: FastAPI request object
+        middleware_name: Name of the middleware
+        duration_ms: Processing time in milliseconds
     """
-    if duration_ms > 50:  # Log slow middleware operations
+    # Update performance statistics
+    if middleware_name not in middleware_performance_stats:
+        middleware_performance_stats[middleware_name] = {
+            'total_requests': 0,
+            'total_time_ms': 0,
+            'max_time_ms': 0,
+            'slow_requests': 0
+        }
+    
+    stats = middleware_performance_stats[middleware_name]
+    stats['total_requests'] += 1
+    stats['total_time_ms'] += duration_ms
+    stats['max_time_ms'] = max(stats['max_time_ms'], duration_ms)
+    
+    # Get threshold for this middleware
+    threshold = MIDDLEWARE_TIMING_THRESHOLDS.get(middleware_name, MIDDLEWARE_TIMING_THRESHOLDS['default'])
+    
+    # Log and track slow requests
+    if duration_ms > threshold:
+        stats['slow_requests'] += 1
         logger.warning(
-            f"⚠️ [PERF] Slow {middleware_name}: {duration_ms:.1f}ms for {request.url.path}"
+            f"[MIDDLEWARE-TIMING] {middleware_name} took {duration_ms:.2f}ms "
+            f"for {request.method} {request.url.path} (threshold: {threshold}ms)"
         )
-    elif duration_ms > 10:  # Debug log moderate timing
+    elif duration_ms > 5:  # Debug log moderate timing
         logger.debug(
-            f"🔍 [PERF] {middleware_name}: {duration_ms:.1f}ms for {request.url.path}"
+            f"[MIDDLEWARE-TIMING] {middleware_name}: {duration_ms:.2f}ms "
+            f"for {request.method} {request.url.path}"
         )
+
+def should_bypass_heavy_middleware(request: Request) -> bool:
+    """
+    Check if heavy middleware should be bypassed for this request.
+    
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        True if heavy middleware should be bypassed
+    """
+    # Check for fastlane bypass flag
+    if hasattr(request.state, 'bypass_heavy_middleware') and request.state.bypass_heavy_middleware:
+        return True
+        
+    return is_fastpath(request)
+
+def is_auth_endpoint(request: Request) -> bool:
+    """
+    Check if request is for an authentication endpoint.
+    
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        True if request is for auth endpoint
+    """
+    path = request.url.path
+    return path.startswith('/api/v1/auth/') or path.startswith('/auth/')
+
+def log_auth_performance_warning(request: Request, total_time_ms: float):
+    """
+    Log performance warnings specifically for auth endpoints.
+    
+    Args:
+        request: FastAPI request object
+        total_time_ms: Total processing time in milliseconds
+    """
+    if not is_auth_endpoint(request):
+        return
+    
+    path = request.url.path
+    
+    if total_time_ms > 1500:  # 1.5 second target
+        logger.error(
+            f"🚨 [AUTH-PERFORMANCE] CRITICAL: {path} took {total_time_ms:.0f}ms "
+            f"(target: <1500ms, optimal: <500ms)"
+        )
+    elif total_time_ms > 500:  # 500ms optimal
+        logger.warning(
+            f"⚠️ [AUTH-PERFORMANCE] SLOW: {path} took {total_time_ms:.0f}ms "
+            f"(target: <1500ms, optimal: <500ms)"
+        )
+    elif total_time_ms > 100:  # 100ms good
+        logger.info(
+            f"ℹ️ [AUTH-PERFORMANCE] OK: {path} took {total_time_ms:.0f}ms "
+            f"(target: <1500ms, optimal: <500ms)"
+        )
+
+def get_middleware_performance_stats() -> Dict[str, Any]:
+    """
+    Get comprehensive middleware performance statistics.
+    
+    Returns:
+        Dictionary containing performance statistics for all middleware
+    """
+    stats = {}
+    
+    for middleware_name, data in middleware_performance_stats.items():
+        avg_time = data['total_time_ms'] / max(data['total_requests'], 1)
+        slow_percentage = (data['slow_requests'] / max(data['total_requests'], 1)) * 100
+        
+        stats[middleware_name] = {
+            'total_requests': data['total_requests'],
+            'avg_time_ms': round(avg_time, 2),
+            'max_time_ms': round(data['max_time_ms'], 2),
+            'slow_requests': data['slow_requests'],
+            'slow_percentage': round(slow_percentage, 2),
+            'threshold_ms': MIDDLEWARE_TIMING_THRESHOLDS.get(
+                middleware_name, 
+                MIDDLEWARE_TIMING_THRESHOLDS['default']
+            )
+        }
+    
+    return stats

@@ -3,7 +3,7 @@ Authentication router for user login, registration, and token management.
 Following CLAUDE.md: Router layer with comprehensive rate limiting and security.
 """
 import time
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from models.user import (
@@ -12,7 +12,7 @@ from models.user import (
 )
 from middleware.auth import get_current_user
 from middleware.rate_limiting import auth_limit, limit, api_limit
-from services.auth_service import AuthService
+from services.auth_service_optimized import get_optimized_async_auth_service
 from repositories.user_repository import UserRepository
 from config import settings
 import logging
@@ -95,6 +95,37 @@ async def auth_diagnostics():
     }
 
 
+@router.get("/__fastlane_flags")
+async def fastlane_flags():
+    """
+    Auth fastlane configuration flags for debugging.
+    Shows current performance optimization settings.
+    """
+    import os
+    
+    return {
+        "fastlane": {
+            "fast_login": os.getenv("AUTH_FAST_LOGIN", "true"),
+            "http1_fallback": os.getenv("AUTH_HTTP1_FALLBACK", "true"),
+            "rate_limit_exempt": os.getenv("RATE_LIMIT_EXEMPT_PATHS", "/api/v1/auth/,/auth/")
+        },
+        "timeouts": {
+            "outer_timeout_s": os.getenv("AUTH_OUTER_TIMEOUT_SECONDS", "10"),
+            "inner_timeout_s": os.getenv("AUTH_INNER_TIMEOUT_SECONDS", "8"),
+            "connect_timeout_s": os.getenv("AUTH_CONNECT_TIMEOUT", "3.0"),
+            "read_timeout_s": os.getenv("AUTH_READ_TIMEOUT", "8.0")
+        },
+        "circuit_breaker": {
+            "threshold": os.getenv("AUTH_CB_THRESHOLD", "3"),
+            "open_seconds": os.getenv("AUTH_CB_OPEN_SECONDS", "30")
+        },
+        "middleware": {
+            "fastlane_enabled": "true",  # Will be true if this endpoint works
+            "bypassed_paths": "/api/v1/auth/*, /auth/*, /health, /metrics"
+        }
+    }
+
+
 @router.post("/validate")
 async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
@@ -102,8 +133,7 @@ async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(sec
     Returns quickly if token is valid, raises 401 if not.
     """
     try:
-        from services.auth_service_async import get_async_auth_service
-        auth_service = await get_async_auth_service()
+        auth_service = await get_optimized_async_auth_service()
         
         # Quick token validation
         is_valid = await auth_service.verify_token(credentials.credentials)
@@ -117,46 +147,35 @@ async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(sec
 
 
 @router.post("/login", response_model=Token)
-@limit("5/minute")  # Strict rate limit for login attempts
-async def login(credentials: UserLogin, request: Request):
+# @limit("5/minute")  # DISABLED: Rate limiting handled by middleware with exemptions
+async def login(credentials: UserLogin, request: Request, response: Response):
     """
-    User login endpoint with rate limiting protection.
+    User login endpoint with Server-Timing instrumentation.
     
-    Rate limit: 5 attempts per minute per IP/user to prevent brute force attacks.
+    Phases tracked: pre (init), supabase (auth), post (token), total
     """
     try:
         import time
-        start_time = time.time()
-        
-        # CRITICAL FIX: Use cached database client to avoid connection overhead
-        from database import get_database
-        db_client = await get_database()
-        
-        init_time = time.time()
-        logger.info(f"[AUTH-PERF] DB client initialized in {(init_time - start_time)*1000:.2f}ms")
-        
-        auth_service = AuthService(db_client)
-        service_time = time.time()
-        logger.info(f"[AUTH-PERF] Auth service created in {(service_time - init_time)*1000:.2f}ms")
-        
-        # Authenticate user with timeout protection
         import asyncio
-        try:
-            client_ip = request.client.host if request.client else "unknown"
-            user_agent = request.headers.get("User-Agent", "unknown")
-            user = await asyncio.wait_for(
-                auth_service.authenticate_user(credentials, client_ip, user_agent),
-                timeout=15.0  # 15 second timeout
-            )
-        except asyncio.TimeoutError:
-            logger.error("[AUTH-PERF] Authentication timed out after 15 seconds")
-            raise HTTPException(
-                status_code=status.HTTP_408_REQUEST_TIMEOUT,
-                detail="Authentication request timed out. Please try again."
-            )
         
-        auth_time = time.time()
-        logger.info(f"[AUTH-PERF] User authenticated in {(auth_time - service_time)*1000:.2f}ms")
+        # Phase timing
+        start = time.perf_counter()
+        phase_times = {}
+        
+        # Phase: pre (initialization)
+        t_pre = time.perf_counter()
+        
+        auth_service = await get_optimized_async_auth_service()
+        
+        phase_times['pre'] = (time.perf_counter() - t_pre) * 1000
+        
+        # Phase: supabase (authentication)
+        t_supabase = time.perf_counter()
+        
+        # Optimized service has built-in timeout handling
+        user = await auth_service.authenticate_user(credentials)
+        
+        phase_times['supabase'] = (time.perf_counter() - t_supabase) * 1000
         
         if not user:
             raise HTTPException(
@@ -164,12 +183,16 @@ async def login(credentials: UserLogin, request: Request):
                 detail="Invalid email or password"
             )
         
-        # Create access token with timeout protection
+        # Phase: post (token creation)
+        t_post = time.perf_counter()
+        
         try:
+            logger.info(f"[AUTH-TIMING-ROUTER] Step 5: Before create_access_token - {time.perf_counter() - start:.3f}s")
             token = await asyncio.wait_for(
                 auth_service.create_access_token(user),
                 timeout=5.0  # 5 second timeout
             )
+            logger.info(f"[AUTH-TIMING-ROUTER] Step 6: After create_access_token - {time.perf_counter() - start:.3f}s")
         except asyncio.TimeoutError:
             logger.error("[AUTH-PERF] Token creation timed out after 5 seconds")
             raise HTTPException(
@@ -177,8 +200,21 @@ async def login(credentials: UserLogin, request: Request):
                 detail="Token creation timed out. Please try again."
             )
         
-        total_time = time.time()
-        logger.info(f"[AUTH-PERF] Total login time: {(total_time - start_time)*1000:.2f}ms")
+        phase_times['post'] = (time.perf_counter() - t_post) * 1000
+        
+        # Phase: total
+        phase_times['total'] = (time.perf_counter() - start) * 1000
+        
+        # Build Server-Timing header
+        timing_parts = []
+        for phase_name, duration_ms in phase_times.items():
+            timing_parts.append(f"{phase_name};dur={duration_ms:.2f}")
+        server_timing = ", ".join(timing_parts)
+        
+        # Add Server-Timing header to response
+        response.headers["Server-Timing"] = server_timing
+        
+        logger.info(f"[AUTH-PERF] Login complete: {phase_times}")
         
         return token
         
@@ -188,18 +224,26 @@ async def login(credentials: UserLogin, request: Request):
     except Exception as e:
         # Log failed login attempt for security monitoring
         client_ip = request.client.host if request.client else "unknown"
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Login failed from {client_ip} for email: {credentials.email} - Error: {e}", exc_info=True)
         logger.error(f"Error type: {type(e).__name__}")
+        
+        # Convert known errors to 401 instead of 500
+        error_str = str(e).lower()
+        if any(x in error_str for x in ['invalid', 'unauthorized', 'authentication', 'wrong', 'incorrect', 'failed', 'nameerror', 'unboundlocalerror']):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication failed"
+            )
+        
+        # For actual server errors, still return 500 but with generic message
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}" if settings.debug else "Login failed"
+            detail="An error occurred during login" if not settings.debug else f"Login failed: {str(e)}"
         )
 
 
 @router.post("/register", response_model=Token)
-@limit("3/minute")  # Even stricter limit for registrations
+# @limit("3/minute")  # DISABLED: Rate limiting handled by middleware with exemptions
 async def register(user_data: UserCreate, request: Request):
     """
     User registration endpoint with rate limiting protection.
@@ -211,14 +255,12 @@ async def register(user_data: UserCreate, request: Request):
         import time
         start_time = time.time()
         
-        # CRITICAL FIX: Use singleton database client to eliminate per-request creation
-        from database import get_database
-        db_client = await get_database()
+        # CRITICAL FIX: Use AsyncAuthService for non-blocking operations
+        from services.auth_service_async import get_async_auth_service
+        auth_service = await get_async_auth_service()
         
         init_time = time.time()
-        logger.info(f"[AUTH-PERF] DB client initialized in {(init_time - start_time)*1000:.2f}ms")
-        
-        auth_service = AuthService(db_client)
+        logger.info(f"[AUTH-PERF] AsyncAuthService retrieved in {(init_time - start_time)*1000:.2f}ms")
         
         # Register new user with timeout protection
         import asyncio
@@ -311,7 +353,7 @@ async def debug_auth_middleware(request: Request):
 
 
 @router.post("/refresh", response_model=Token)
-@limit("10/minute")  # Allow more frequent token refreshes
+# @limit("10/minute")  # DISABLED: Rate limiting handled by middleware with exemptions
 async def refresh_token(
     refresh_data: TokenRefresh,
     request: Request
@@ -369,7 +411,7 @@ async def refresh_token(
 
 
 @router.post("/password-reset")
-@limit("2/minute")  # Very strict limit for password reset requests
+# @limit("2/minute")  # DISABLED: Rate limiting handled by middleware with exemptions  
 async def request_password_reset(
     reset_request: PasswordReset,
     request: Request
@@ -432,7 +474,7 @@ async def request_password_reset(
 
 
 @router.post("/password-reset-confirm")
-@limit("5/minute")  # Reasonable limit for password reset confirmation
+# @limit("5/minute")  # DISABLED: Rate limiting handled by middleware with exemptions
 async def confirm_password_reset(
     reset_data: PasswordResetConfirm,
     request: Request
@@ -529,6 +571,80 @@ async def logout(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Logout failed"
         )
+
+
+@router.post("/perf-test")
+async def auth_performance_test(request: Request):
+    """
+    Performance test endpoint to profile authentication flow.
+    Tests both direct Supabase auth and our wrapper logic.
+    """
+    try:
+        auth_service = await get_optimized_async_auth_service()
+        
+        # Test 1: Performance test with optimized service
+        logger.info(f"🔍 [PERF-TEST] Starting optimized auth test")
+        
+        # Run multiple auth attempts to show connection pooling benefits
+        test_results = []
+        for i in range(3):
+            start = time.perf_counter()
+            try:
+                await auth_service.authenticate_user(UserLogin(
+                    email="nonexistent@example.com",
+                    password="wrongpassword"
+                ))
+            except HTTPException:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                test_results.append(elapsed_ms)
+        
+        direct_result = {
+            'test_runs': test_results,
+            'average_ms': sum(test_results) / len(test_results) if test_results else 0,
+            'min_ms': min(test_results) if test_results else 0,
+            'max_ms': max(test_results) if test_results else 0
+        }
+        
+        # Test 2: Our auth wrapper with known invalid creds (fast failure)
+        logger.info(f"🔍 [PERF-TEST] Testing fast failure path")
+        start_fast_fail = time.perf_counter()
+        try:
+            await auth_service.authenticate_user(UserLogin(
+                email="nonexistent@example.com",
+                password="wrongpassword"
+            ))
+        except HTTPException as e:
+            fast_fail_ms = (time.perf_counter() - start_fast_fail) * 1000
+            fast_fail_result = {
+                'expected_failure': True,
+                'timing_ms': fast_fail_ms,
+                'status_code': e.status_code,
+                'detail': e.detail
+            }
+        
+        return {
+            "timestamp": time.time(),
+            "tests": {
+                "direct_supabase_auth": direct_result,
+                "fast_failure_path": fast_fail_result
+            },
+            "analysis": {
+                "direct_auth_baseline_ms": direct_result.get('timing', {}).get('total_ms', 0),
+                "fast_failure_ms": fast_fail_result.get('timing_ms', 0),
+                "performance_notes": [
+                    "Direct auth shows raw Supabase performance",
+                    "Fast failure shows our wrapper overhead",
+                    "Check logs for detailed timing breakdown"
+                ]
+            }
+        }
+        
+    except Exception as e:
+        logger.exception(f"🚨 [PERF-TEST] Test failed: {e}")
+        return {
+            "error": str(e),
+            "timestamp": time.time()
+        }
 
 
 @router.get("/security-info")

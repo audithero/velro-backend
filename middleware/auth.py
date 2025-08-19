@@ -64,7 +64,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
             "/api/v1/auth/refresh",
             "/api/v1/auth/health",
             "/api/v1/auth/security-info",
+            "/api/v1/auth/ping",
+            "/api/v1/auth/diag",
+            "/api/v1/auth/__fastlane_flags",
+            "/api/v1/public/flags",
+            "/api/v1/public/health/auth",
             "/api/v1/generations/models/supported",  # Public models endpoint
+            "/generations/models/supported",  # Public models endpoint (without /api/v1 prefix)
             "/api/v1/debug/database",  # Debug endpoints
             "/api/v1/debug/user/",  # Debug user lookup (prefix)
             "/api/v1/debug/token/",  # Debug token validation (prefix)
@@ -130,66 +136,83 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     detail="Authentication failed - invalid token format"
                 )
             
-            # === SECURITY ENHANCED - Standard JWT Token Verification ===
-            # Try JWT verification first (more secure and faster)
-            try:
-                # Use secure JWT verification
-                payload = JWTSecurity.verify_token(token, "access_token")
-                user_id = payload.get("sub")
-                email = payload.get("email")
-                
-                if user_id and email:
-                    logger.info(f"✅ [AUTH-MIDDLEWARE] JWT token verification successful for user {user_id}")
-                    
-                    # Get enhanced profile from database - ASYNC OPTIMIZED
-                    try:
-                        from database import SupabaseClient
-                        db_client = SupabaseClient()
-                        
-                        if db_client.is_available():
-                            # PERFORMANCE FIX: Use async database operations with timeout
-                            profile_result = await db_client.execute_query_async(
-                                table='users',
-                                operation='select',
-                                filters={'id': str(user_id)},
-                                use_service_key=True,
-                                single=True,
-                                timeout=2.0  # 2 second timeout for profile lookup
-                            )
-                            
-                            if profile_result:
-                                profile = profile_result
-                                
-                                from utils.uuid_utils import UUIDUtils
-                                safe_user_id = UUIDUtils.validate_and_convert(user_id, "JWT_profile_lookup")
-                                return UserResponse(
-                                    id=safe_user_id,
-                                    email=email,
-                                    display_name=profile.get('display_name', ''),
-                                    avatar_url=profile.get('avatar_url'),
-                                    credits_balance=profile.get('credits_balance', 100),
-                                    role=profile.get('role', 'viewer'),
-                                    created_at=datetime.now(timezone.utc)
-                                )
-                    except Exception as db_error:
-                        logger.warning(f"⚠️ [AUTH-MIDDLEWARE] Database profile fetch failed, using JWT data: {db_error}")
-                    
-                    # Fallback to JWT data
-                    from utils.uuid_utils import UUIDUtils
-                    safe_user_id = UUIDUtils.validate_and_convert(user_id, "JWT_fallback")
-                    return UserResponse(
-                        id=safe_user_id,
-                        email=email,
-                        display_name=payload.get('display_name', ''),
-                        avatar_url=payload.get('avatar_url'),
-                        credits_balance=payload.get('credits_balance', settings.default_user_credits or 100),
-                        role=payload.get('role', 'viewer'),
-                        created_at=datetime.now(timezone.utc)
-                    )
+            # === SECURITY ENHANCED - Supabase JWT Token Verification ===
+            # Check if we should use Supabase auth
+            use_supabase = os.getenv("USE_SUPABASE_AUTH", "false").lower() == "true"
             
-            except SecurityError as jwt_error:
-                logger.info(f"🔍 [AUTH-MIDDLEWARE] JWT verification failed, trying Supabase: {jwt_error}")
-                # Fall through to Supabase verification
+            if use_supabase:
+                # Use Supabase JWT verification
+                try:
+                    from services.supabase_auth import get_supabase_auth
+                    auth_service = get_supabase_auth()
+                    payload = auth_service.verify_jwt(token)
+                    user_id = payload.get("sub")
+                    email = payload.get("email")
+                except Exception as e:
+                    logger.debug(f"Supabase JWT verification failed: {e}")
+                    # Fall through to try standard JWT
+                    payload = None
+                    user_id = None
+                    email = None
+            else:
+                # Use standard JWT verification for backward compatibility
+                try:
+                    payload = JWTSecurity.verify_token(token, "access_token")
+                    user_id = payload.get("sub")
+                    email = payload.get("email")
+                except Exception:
+                    payload = None
+                    user_id = None
+                    email = None
+            
+            if user_id and email:
+                logger.info(f"✅ [AUTH-MIDDLEWARE] JWT token verification successful for user {user_id}")
+                
+                # Get enhanced profile from database - ASYNC OPTIMIZED
+                try:
+                    from database import SupabaseClient
+                    db_client = SupabaseClient()
+                    
+                    if db_client.is_available():
+                        # PERFORMANCE FIX: Use async database operations with timeout
+                        profile_result = await db_client.execute_query_async(
+                            table='users',
+                            operation='select',
+                            filters={'id': str(user_id)},
+                            use_service_key=True,
+                            single=True,
+                            timeout=2.0  # 2 second timeout for profile lookup
+                        )
+                        
+                        if profile_result:
+                            profile = profile_result
+                            
+                            from utils.uuid_utils import UUIDUtils
+                            safe_user_id = UUIDUtils.validate_and_convert(user_id, "JWT_profile_lookup")
+                            return UserResponse(
+                                id=safe_user_id,
+                                email=email,
+                                display_name=profile.get('display_name', ''),
+                                avatar_url=profile.get('avatar_url'),
+                                credits_balance=profile.get('credits_balance', 100),
+                                role=profile.get('role', 'viewer'),
+                                created_at=datetime.now(timezone.utc)
+                            )
+                except Exception as db_error:
+                    logger.warning(f"⚠️ [AUTH-MIDDLEWARE] Database profile fetch failed, using JWT data: {db_error}")
+                
+                # Fallback to JWT data
+                from utils.uuid_utils import UUIDUtils
+                safe_user_id = UUIDUtils.validate_and_convert(user_id, "JWT_fallback")
+                return UserResponse(
+                    id=safe_user_id,
+                    email=email,
+                    display_name=payload.get('display_name', '') if payload else '',
+                    avatar_url=payload.get('avatar_url') if payload else None,
+                    credits_balance=payload.get('credits_balance', settings.default_user_credits or 100) if payload else 100,
+                    role=payload.get('role', 'viewer') if payload else 'viewer',
+                    created_at=datetime.now(timezone.utc)
+                )
             
             # === Fallback: Use AsyncAuthService for token verification ===
             logger.info(f"🔍 [AUTH-MIDDLEWARE] Using AsyncAuthService for token verification")
@@ -324,8 +347,27 @@ async def get_current_user(
     
     # Primary: Try to get user from request state (set by middleware)
     if hasattr(request.state, 'user') and request.state.user:
-        logger.info(f"✅ [AUTH-DEPENDENCY] User found in request state: {request.state.user.id}")
-        return request.state.user
+        user_data = request.state.user
+        # Handle both dict and UserResponse object formats
+        if isinstance(user_data, dict):
+            user_id = user_data.get("id", user_data.get("sub"))
+            logger.info(f"✅ [AUTH-DEPENDENCY] User dict found in request state: {user_id}")
+            # Convert dict to UserResponse
+            from utils.uuid_utils import UUIDUtils
+            safe_user_id = UUIDUtils.safe_uuid_convert(user_id) if isinstance(user_id, str) else user_id
+            return UserResponse(
+                id=safe_user_id,
+                email=user_data.get("email", ""),
+                display_name=user_data.get("display_name", ""),
+                avatar_url=user_data.get("avatar_url"),
+                credits_balance=user_data.get("credits_balance", getattr(settings, "default_user_credits", 100)),
+                role=user_data.get("role", "authenticated"),
+                created_at=datetime.now(timezone.utc)
+            )
+        else:
+            # It's already a UserResponse object
+            logger.info(f"✅ [AUTH-DEPENDENCY] User object found in request state: {user_data.id}")
+            return user_data
     
     # Secondary: Check if user is in state but None (middleware processed but auth failed)
     if hasattr(request.state, 'user'):
@@ -337,7 +379,7 @@ async def get_current_user(
         )
     
     # Tertiary: If not in state, verify token manually (fallback for edge cases)
-    if not credentials:
+    if not credentials or not credentials.credentials:
         logger.error(f"❌ [AUTH-DEPENDENCY] No credentials provided and no user in state")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -345,14 +387,33 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Manual token verification as fallback using AsyncAuthService
-    logger.warning(f"⚠️ [AUTH-DEPENDENCY] Falling back to manual token verification via AsyncAuthService")
+    # Manual token verification as fallback - use JWT verification directly
+    logger.warning(f"⚠️ [AUTH-DEPENDENCY] Falling back to manual JWT token verification")
     try:
-        # Get async auth service
-        auth_service = await get_async_auth_service()
+        # Use JWTSecurity to verify token directly (already imported at top)
+        from utils.uuid_utils import UUIDUtils
         
-        # Get user by token
-        user = await auth_service.get_user_by_token(credentials.credentials)
+        payload = JWTSecurity.verify_token(credentials.credentials, "access_token")
+        user_id = payload.get("sub")
+        email = payload.get("email")
+        
+        if not user_id or not email:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token payload",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        safe_user_id = UUIDUtils.safe_uuid_convert(user_id) if isinstance(user_id, str) else user_id
+        user = UserResponse(
+            id=safe_user_id,
+            email=email,
+            display_name=payload.get('display_name', ''),
+            avatar_url=payload.get('avatar_url'),
+            credits_balance=payload.get('credits_balance', getattr(settings, "default_user_credits", 100)),
+            role=payload.get('role', 'viewer'),
+            created_at=datetime.now(timezone.utc)
+        )
         
         if not user:
             logger.error(f"❌ [AUTH-DEPENDENCY] Manual token verification failed - no user found")
@@ -362,32 +423,27 @@ async def get_current_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
-        logger.info(f"✅ [AUTH-DEPENDENCY] Manual token verification successful for {user.id}")
+        logger.info(f"✅ [AUTH-DEPENDENCY] Manual token verification successful for {safe_user_id}")
         
         # Set user in request state for consistency
         request.state.user = user
-        request.state.user_id = user.id
+        request.state.user_id = safe_user_id
         
         return user
         
+    except SecurityError as e:
+        # JWT verification failed (invalid token, expired, etc.)
+        logger.error(f"❌ [AUTH-DEPENDENCY] JWT verification failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
-    except httpx.TimeoutException:
-        logger.error(f"❌ [AUTH-DEPENDENCY] Manual token verification timeout")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service timeout",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except httpx.RequestError as e:
-        logger.error(f"❌ [AUTH-DEPENDENCY] Manual token verification request error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service error",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
     except Exception as e:
+        # Any other error during token verification
         logger.error(f"❌ [AUTH-DEPENDENCY] Manual token verification failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -512,9 +568,24 @@ def require_auth(required_role: Optional[str] = None, required_permissions: Opti
 async def get_user_supabase_client(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """Get an authenticated HTTP client for the current user using AsyncAuthService."""
+    """
+    Get an authenticated Supabase client for the current user.
+    This client enforces RLS (Row Level Security) policies.
+    
+    In production, this requires a valid JWT token.
+    For development, USE_SERVICE_CLIENT_FALLBACK=true can bypass this (NOT for production).
+    """
+    
+    # Check for service client fallback (development only)
+    use_fallback = os.getenv("USE_SERVICE_CLIENT_FALLBACK", "false").lower() == "true"
+    environment = os.getenv("ENVIRONMENT", "production")
     
     if not credentials:
+        # No token provided - check if fallback is allowed
+        if use_fallback and environment != "production":
+            logger.warning("⚠️ [AUTH-MIDDLEWARE] No token provided, using service client fallback (DEV ONLY)")
+            return db.service_client
+        
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization header required",
@@ -543,26 +614,34 @@ async def get_user_supabase_client(
         # Get async auth service
         auth_service = await get_async_auth_service()
         
-        # Get authenticated HTTP client configured for user
+        # Get authenticated Supabase client configured for user with RLS
         authenticated_client = await auth_service.get_authenticated_client(token)
         
-        logger.info(f"✅ [AUTH-MIDDLEWARE] Authenticated HTTP client created via AsyncAuthService")
+        logger.info(f"✅ [AUTH-MIDDLEWARE] Authenticated Supabase client created with RLS for user")
         return authenticated_client
         
-    except httpx.TimeoutException:
-        logger.error(f"❌ [AUTH-MIDDLEWARE] Timeout creating authenticated client")
+    except ValueError as e:
+        # Invalid token format
+        logger.error(f"❌ [AUTH-MIDDLEWARE] Invalid token: {e}")
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service timeout"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid authentication token: {e}"
         )
-    except httpx.RequestError as e:
-        logger.error(f"❌ [AUTH-MIDDLEWARE] Request error creating authenticated client: {e}")
+    except RuntimeError as e:
+        # Failed to create client
+        logger.error(f"❌ [AUTH-MIDDLEWARE] Failed to create authenticated client: {e}")
+        
+        # Check if fallback is allowed for development
+        if use_fallback and environment != "production":
+            logger.warning("⚠️ [AUTH-MIDDLEWARE] Falling back to service client (DEV ONLY)")
+            return db.service_client
+        
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service error"
+            detail="Authentication service unavailable"
         )
     except Exception as e:
-        logger.error(f"❌ [AUTH-MIDDLEWARE] Failed to create authenticated client via AsyncAuthService: {e}")
+        logger.error(f"❌ [AUTH-MIDDLEWARE] Unexpected error creating authenticated client: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Client creation failed"

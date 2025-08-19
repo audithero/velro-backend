@@ -221,18 +221,58 @@ def get_models_by_type(model_type: FALModelType) -> Dict[str, FALModelConfig]:
     }
 
 def validate_model_parameters(model_id: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate parameters against model configuration."""
+    """Validate parameters against model configuration - strict mode that only allows valid params."""
     config = get_model_config(model_id)
     validated_params = {}
     
+    # Only include parameters that are defined for this specific model
     for param_name, param_config in config.parameters.items():
         if param_name in parameters:
             value = parameters[param_name]
-            # Basic validation - in production, implement proper validation
+            
+            # Type validation
+            param_type = param_config.get("type")
+            if param_type == "integer" and not isinstance(value, int):
+                try:
+                    value = int(value)
+                except (ValueError, TypeError):
+                    raise ValueError(f"Parameter '{param_name}' must be an integer for model {model_id}")
+            elif param_type == "number" and not isinstance(value, (int, float)):
+                try:
+                    value = float(value)
+                except (ValueError, TypeError):
+                    raise ValueError(f"Parameter '{param_name}' must be a number for model {model_id}")
+            elif param_type == "boolean" and not isinstance(value, bool):
+                value = bool(value)
+            elif param_type == "string" and not isinstance(value, str):
+                value = str(value)
+            
+            # Enum validation
+            if "enum" in param_config and value not in param_config["enum"]:
+                raise ValueError(f"Parameter '{param_name}' must be one of {param_config['enum']} for model {model_id}")
+            
+            # Range validation
+            if "min" in param_config and value < param_config["min"]:
+                value = param_config["min"]
+            if "max" in param_config and value > param_config["max"]:
+                value = param_config["max"]
+            
+            # Max length validation for strings
+            if param_type == "string" and "max_length" in param_config:
+                if len(value) > param_config["max_length"]:
+                    value = value[:param_config["max_length"]]
+            
             validated_params[param_name] = value
         elif param_config.get("required", False):
             raise ValueError(f"Required parameter '{param_name}' missing for model {model_id}")
         elif "default" in param_config:
             validated_params[param_name] = param_config["default"]
+    
+    # Log any parameters that were removed for being invalid
+    removed_params = set(parameters.keys()) - set(validated_params.keys())
+    if removed_params:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Removed invalid parameters for model {model_id}: {removed_params}")
     
     return validated_params

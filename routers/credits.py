@@ -4,12 +4,19 @@ Credits router for user credit management and transactions.
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import List, Optional
 from uuid import UUID
+import time
 
 from middleware.auth import get_current_user
 from middleware.rate_limiting import limit
 from models.user import UserResponse
 
 router = APIRouter(tags=["credits"])
+
+
+@router.get("/_ping")
+async def ping_credits():
+    """Health check endpoint for credits router - no auth required."""
+    return {"ok": True, "service": "credits", "timestamp": time.time()}
 
 
 @router.get("/balance")

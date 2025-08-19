@@ -39,9 +39,10 @@ structlog==23.2.0
 sentry-sdk[fastapi]==1.39.1
 prometheus-client==0.19.0
 
-# Rate limiting
+# Rate limiting and retry logic
 slowapi==0.1.9
 tenacity==8.2.3
+backoff==2.2.1
 
 # Database drivers
 asyncpg==0.29.0

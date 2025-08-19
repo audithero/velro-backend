@@ -2,6 +2,18 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+
+# Backup and temporary files
+*.backup
+*.backup.*
+*_backup_*
+*_old
+*_OLD
+*_recovery
+*_refactored
+*.tmp
+*.temp
 
 # C extensions
 *.so

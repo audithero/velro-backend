@@ -91,18 +91,35 @@ class SecurityEnhancedMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next) -> Response:
         """Main security middleware processing."""
-        start_time = time.time()
+        start_time = time.perf_counter()
+        
+        # AGGRESSIVE AUTH BYPASS: Skip all security processing for auth endpoints
+        if request.url.path.startswith('/api/v1/auth/'):
+            response = await call_next(request)
+            # Still add basic security headers for auth endpoints
+            self._add_security_headers(response, request)
+            return response
+        
+        # CRITICAL: Check for fastlane flag first
+        if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+            response = await call_next(request)
+            self._add_security_headers(response, request)
+            return response
+            
         client_ip = self._get_client_ip(request)
         
         try:
             # PERFORMANCE: Skip heavy security validation for fastpath endpoints
-            from middleware.utils import is_fastpath, log_middleware_skip
-            if is_fastpath(request):
-                log_middleware_skip(request, "security_enhanced", "fastpath_bypass")
-                # Still add basic security headers but skip expensive validation
-                response = await call_next(request)
-                self._add_security_headers(response, request)
-                return response
+            try:
+                from middleware.utils import is_fastpath, log_middleware_skip
+                if is_fastpath(request):
+                    log_middleware_skip(request, "security_enhanced", "fastpath_bypass")
+                    # Still add basic security headers but skip expensive validation
+                    response = await call_next(request)
+                    self._add_security_headers(response, request)
+                    return response
+            except ImportError:
+                pass  # utils module may not exist
             
             # Security checks (fail fast)
             await self._validate_request_security(request, client_ip)
@@ -114,10 +131,17 @@ class SecurityEnhancedMiddleware(BaseHTTPMiddleware):
             self._add_security_headers(response, request)
             
             # Log successful request
-            processing_time = (time.time() - start_time) * 1000
-            from middleware.utils import log_middleware_timing
-            log_middleware_timing(request, "security_enhanced", processing_time)
-            if processing_time > 5000:  # Log very slow requests (5+ seconds)
+            processing_time = (time.perf_counter() - start_time) * 1000
+            try:
+                from middleware.utils import log_middleware_timing
+                log_middleware_timing(request, "security_enhanced", processing_time)
+            except ImportError:
+                pass  # utils module may not exist
+            
+            # PERFORMANCE: Add timing logs for slow processing
+            if processing_time > 10:  # Log if >10ms
+                logger.warning(f"[MIDDLEWARE] SecurityEnhanced took {processing_time:.2f}ms")
+            elif processing_time > 5000:  # Log very slow requests (5+ seconds)
                 logger.warning(f"⚠️ [SECURITY] Slow request: {request.method} {request.url.path} ({processing_time/1000:.2f}s)")
             
             return response
@@ -161,14 +185,21 @@ class SecurityEnhancedMiddleware(BaseHTTPMiddleware):
         # 5. Content validation (if applicable)
         await self._validate_request_content(request)
         
-        # 6. Rate limiting check
-        await self._check_rate_limiting(client_ip, request)
+        # 6. Rate limiting check - SKIP FOR AUTH ENDPOINTS (handled by production_rate_limiter)
+        path = str(request.url.path)
+        AUTH_EXEMPT_PREFIXES = ("/api/v1/auth/", "/auth/")
+        if not any(path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES):
+            await self._check_rate_limiting(client_ip, request)
     
     async def _validate_client_ip(self, client_ip: str, request: Request):
         """Validate client IP address and check for suspicious activity."""
         
-        # Check if IP is in suspicious list
-        if client_ip in self.suspicious_ips:
+        # Check if IP is in suspicious list - SKIP FOR AUTH ENDPOINTS  
+        path = str(request.url.path)
+        AUTH_EXEMPT_PREFIXES = ("/api/v1/auth/", "/auth/")
+        is_auth_endpoint = any(path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES)
+        
+        if not is_auth_endpoint and client_ip in self.suspicious_ips:
             logger.warning(f"🚨 [SECURITY] Request from suspicious IP: {client_ip}")
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,

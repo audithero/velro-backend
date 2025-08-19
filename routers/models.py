@@ -56,6 +56,85 @@ async def list_models(
         raise HTTPException(status_code=500, detail="Failed to retrieve models")
 
 
+@router.get("/supported")
+async def get_supported_models(
+    model_type: Optional[str] = None
+):
+    """Get list of supported models - public endpoint for frontend with fallback."""
+    
+    # Fallback models to keep UI functional
+    FALLBACK_MODELS = [
+        {
+            "model_id": "fal-ai/flux-pro/v1.1-ultra",
+            "name": "Flux Pro Ultra",
+            "type": "image",
+            "credits": 50,
+            "description": "Premium quality image generation",
+            "is_active": True
+        },
+        {
+            "model_id": "fal-ai/flux/dev",
+            "name": "Flux Dev",
+            "type": "image", 
+            "credits": 10,
+            "description": "Fast development image generation",
+            "is_active": True
+        },
+        {
+            "model_id": "fal-ai/sdxl-lightning-4step",
+            "name": "SDXL Lightning",
+            "type": "image",
+            "credits": 5,
+            "description": "Ultra-fast image generation",
+            "is_active": True
+        }
+    ]
+    
+    try:
+        # Try to get models from FAL.ai registry
+        if model_type:
+            try:
+                from models.fal_config import FALModelType
+                model_type_enum = FALModelType(model_type.lower())
+                fal_models = get_models_by_type(model_type_enum)
+            except ValueError:
+                # Invalid model type, return fallback filtered by type
+                filtered = [m for m in FALLBACK_MODELS if m["type"] == model_type.lower()]
+                return {"models": filtered, "count": len(filtered), "source": "fallback"}
+        else:
+            fal_models = get_all_models()
+        
+        # Convert to simple format for frontend
+        models = []
+        for model_id, config in fal_models.items():
+            models.append({
+                "model_id": model_id,
+                "name": model_id.replace("fal-ai/", "").replace("-", " ").title(),
+                "type": config.ai_model_type.value,
+                "credits": config.credits,
+                "description": config.description or f"{config.ai_model_type.value.title()} generation model",
+                "is_active": True
+            })
+        
+        return {
+            "models": models,
+            "count": len(models),
+            "source": "fal"
+        }
+        
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception(f"Models endpoint using fallback due to error: {e}")
+        
+        # Return fallback models to keep UI functional
+        if model_type:
+            filtered = [m for m in FALLBACK_MODELS if m["type"] == model_type.lower()]
+            return {"models": filtered, "count": len(filtered), "source": "fallback"}
+        
+        return {"models": FALLBACK_MODELS, "count": len(FALLBACK_MODELS), "source": "fallback"}
+
+
 @router.get("/{model_id}")
 async def get_model(model_id: str):
     """Get model configuration by ID from FAL.ai registry."""
