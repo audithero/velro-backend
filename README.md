@@ -289,3 +289,12 @@ Private repository - All rights reserved
 **Last Updated**: January 2025  
 **Version**: 2.0.0 (Async Architecture)  
 **Status**: ✅ Production Ready
+
+---
+
+## Deployment Notes
+- This backend is deployed as an independent Railway service.
+- The frontend is a separate service at `https://velro-frontend-production.up.railway.app`.
+
+## Credits
+- New user signup credits: 1000 (`DEFAULT_USER_CREDITS`).
