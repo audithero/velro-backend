@@ -6,17 +6,42 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import List, Optional
 from uuid import UUID
 import logging
+import time
 
-from middleware.auth import get_current_user, get_user_supabase_client
+from middleware.auth import get_current_user
 from middleware.rate_limiting import limit
 from services.project_service import ProjectService
 from repositories.project_repository import ProjectRepository
 from models.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from models.user import UserResponse
+from services.auth_service_async import get_async_auth_service
 
 router = APIRouter(tags=["projects"])
 logger = logging.getLogger(__name__)
 
+
+@router.get("/_ping")
+async def ping_projects():
+    """Health check endpoint for projects router - no auth required."""
+    return {"ok": True, "service": "projects", "timestamp": time.time()}
+
+
+async def get_user_client(request: Request, current_user: UserResponse = Depends(get_current_user)):
+    """Get authenticated Supabase client for the current user."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+    token = auth.split(" ", 1)[1]
+    
+    try:
+        svc = await get_async_auth_service()
+        # Pass the token directly - get_authenticated_client expects a string token
+        client = await svc.get_authenticated_client(token)
+        logger.info(f"✅ [PROJECTS] Got authenticated client for user {current_user.id}")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to get authenticated client: {e}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 @router.get("/", response_model=List[ProjectResponse])
 @router.get("", response_model=List[ProjectResponse])  # CRITICAL FIX: Add route without trailing slash
@@ -27,7 +52,7 @@ async def list_projects(
     limit: int = 50,
     visibility: Optional[str] = None,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """List user's projects with optional filtering and pagination."""
     try:
@@ -62,7 +87,7 @@ async def create_project(
     request: Request,
     project_data: ProjectCreate,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """Create a new project."""
     try:
@@ -100,7 +125,7 @@ async def get_project(
     project_id: UUID,
     request: Request,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """Get project by ID."""
     try:
@@ -134,7 +159,7 @@ async def update_project(
     project_data: ProjectUpdate,
     request: Request,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """Update project details."""
     try:
@@ -165,7 +190,7 @@ async def delete_project(
     project_id: UUID,
     request: Request,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """Delete a project."""
     try:
@@ -196,7 +221,7 @@ async def get_project_stats(
     project_id: UUID,
     request: Request,
     current_user: UserResponse = Depends(get_current_user),
-    user_client = Depends(get_user_supabase_client)
+    user_client = Depends(get_user_client)
 ):
     """Get project statistics."""
     try:

@@ -70,11 +70,29 @@ class CSRFProtectionMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next) -> Response:
         """Process request with CSRF protection."""
+        start_time = time.perf_counter()
+        
+        # CRITICAL FIX: Skip CSRF for health check endpoints FIRST before any processing
+        health_check_paths = ['/health', '/healthz', '/ping', '/_health', '/status']
+        if request.url.path in health_check_paths:
+            return await call_next(request)
+        
+        # AGGRESSIVE AUTH BYPASS: Skip all CSRF processing for auth endpoints
+        if request.url.path.startswith('/api/v1/auth/'):
+            return await call_next(request)
         
         # Skip CSRF protection if disabled
         if not settings.csrf_protection_enabled:
-            logger.debug("⚠️ [CSRF] CSRF protection disabled - proceeding without validation")
             return await call_next(request)
+        
+        # CRITICAL: Check for fastlane flag first
+        if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+            return await call_next(request)
+        
+        # PERFORMANCE: Add timing logs for slow processing
+        elapsed = (time.perf_counter() - start_time) * 1000
+        if elapsed > 10:  # Log if >10ms
+            logger.warning(f"[MIDDLEWARE] CSRF protection took {elapsed:.2f}ms")
         
         path = request.url.path
         method = request.method
@@ -142,6 +160,8 @@ class CSRFProtectionMiddleware(BaseHTTPMiddleware):
             "/favicon.ico",
             "/static/",
             "/health",
+            "/api/v1/auth/",  # Auth endpoints (login/register don't need CSRF)
+            "/api/v1/public/",  # Public endpoints
             "/api/v1/e2e/",  # E2E testing endpoints
             "/api/v1/auth-health/"  # Auth health monitoring endpoints
         ]

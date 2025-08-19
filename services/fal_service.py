@@ -7,6 +7,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from uuid import UUID
 import time
+import os
 
 import fal_client
 
@@ -22,8 +23,13 @@ class FALService:
     
     def __init__(self):
         # Configure FAL client
+        # CRITICAL FIX: FAL client requires environment variable, not api_key attribute
         if settings.fal_key:
-            fal_client.api_key = settings.fal_key
+            # Set environment variable for FAL client
+            os.environ['FAL_KEY'] = settings.fal_key
+            logger.info("FAL_KEY environment variable set for FAL client")
+        else:
+            logger.warning("FAL_KEY not configured - FAL API calls will fail")
         
     async def create_generation(
         self,

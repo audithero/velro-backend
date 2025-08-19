@@ -96,6 +96,9 @@ class ProjectRepository:
         visibility: Optional[str] = None
     ) -> List[ProjectResponse]:
         """List projects accessible to user."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
             # Get user's own projects or public projects
             # Use separate queries for OR condition in Supabase Python client

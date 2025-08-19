@@ -4,6 +4,7 @@ Implements tier-based rate limiting with Redis backend and in-memory fallback.
 Follows OWASP security guidelines and PRD specifications.
 """
 
+import os
 import time
 import json
 import asyncio
@@ -16,7 +17,9 @@ from fastapi import Request, Response, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-import redis.asyncio as redis
+from redis.asyncio import Redis
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 from redis.exceptions import RedisError, ConnectionError, TimeoutError
 import logging
 
@@ -52,23 +55,52 @@ except ImportError as e:
 
 # Production-safe rate limit tiers (uses test limits only when explicitly enabled)
 _test_limits = get_test_rate_limits()
-RATE_LIMIT_TIERS = _test_limits if _test_limits is not None else {
-    "free": {
-        "requests_per_minute": 100,  # Significantly increased for auth endpoints  
-        "requests_per_hour": 1000,   # Increased from 300
-        "concurrent_requests": 10    # Increased from 5
-    },
-    "pro": {
-        "requests_per_minute": 300,  # Increased from 100
-        "requests_per_hour": 5000,   # Increased from 2000
-        "concurrent_requests": 50     # Increased from 20
-    },
-    "enterprise": {
-        "requests_per_minute": 1000,   # Increased from 500
-        "requests_per_hour": 20000,   # Increased from 10000
-        "concurrent_requests": 200     # Increased from 100
-    }
-}
+
+# Get rate limits from environment or use defaults
+def get_rate_limit_config():
+    """Get rate limit configuration from environment variables"""
+    try:
+        per_minute = int(os.getenv('RATE_LIMIT_PER_MINUTE', '120'))
+        burst = int(os.getenv('RATE_LIMIT_BURST', '30'))
+        
+        return {
+            "free": {
+                "requests_per_minute": per_minute,
+                "requests_per_hour": per_minute * 10,  # 10x the per-minute rate
+                "concurrent_requests": burst
+            },
+            "pro": {
+                "requests_per_minute": per_minute * 3,
+                "requests_per_hour": per_minute * 30,
+                "concurrent_requests": burst * 2
+            },
+            "enterprise": {
+                "requests_per_minute": per_minute * 10,
+                "requests_per_hour": per_minute * 100,
+                "concurrent_requests": burst * 5
+            }
+        }
+    except (ValueError, TypeError):
+        # Fallback to defaults if env vars are invalid
+        return {
+            "free": {
+                "requests_per_minute": 120,
+                "requests_per_hour": 1200,
+                "concurrent_requests": 30
+            },
+            "pro": {
+                "requests_per_minute": 360,
+                "requests_per_hour": 3600,
+                "concurrent_requests": 60
+            },
+            "enterprise": {
+                "requests_per_minute": 1200,
+                "requests_per_hour": 12000,
+                "concurrent_requests": 150
+            }
+        }
+
+RATE_LIMIT_TIERS = _test_limits if _test_limits is not None else get_rate_limit_config()
 
 # Log the active rate limit configuration
 if _test_limits is not None:
@@ -89,26 +121,20 @@ class ProductionRateLimiter:
         self.redis_timeout = 0.2  # 200ms timeout for Redis operations - increased to prevent connection resets
         
         # Initialize Redis connection if configured with fallback protection
-        if hasattr(settings, 'redis_url') and settings.redis_url:
+        redis_url = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_URL") or (settings.redis_url if hasattr(settings, 'redis_url') else None)
+        if redis_url:
             try:
-                # CRITICAL FIX: Enhanced Redis configuration to prevent "Connection reset by peer" errors
-                self.redis_client = redis.from_url(
-                    settings.redis_url,
-                    socket_connect_timeout=1.0,   # Increased for stability
-                    socket_timeout=0.5,           # Increased socket timeout to prevent resets
-                    socket_keepalive=True,        # Enable keepalive
-                    socket_keepalive_options={},  # Use system defaults
-                    retry_on_timeout=True,        # Retry on timeout for reliability
-                    retry_on_error=[ConnectionError, TimeoutError],  # Retry on connection errors
-                    max_connections=20,           # Reduced to prevent connection exhaustion
+                # Modern Redis connection with retry logic - NO connection_pool_kwargs
+                self.redis_client = Redis.from_url(
+                    redis_url,
+                    encoding="utf-8",
                     decode_responses=True,
-                    health_check_interval=30,     # More frequent health checks
-                    connection_pool_kwargs={
-                        'max_connections': 20,
-                        'retry_on_timeout': True,
-                        'socket_keepalive': True,
-                        'socket_keepalive_options': {}
-                    }
+                    retry=Retry(ExponentialBackoff(), 3),  # Exponential backoff with 3 retries
+                    health_check_interval=30,               # Health checks every 30 seconds
+                    socket_connect_timeout=2,               # 2 second connection timeout
+                    socket_timeout=1,                       # 1 second operation timeout
+                    socket_keepalive=True,                  # Keep connections alive
+                    max_connections=20                      # Connection pool size
                 )
                 
                 # Test the connection immediately to catch configuration issues
@@ -475,22 +501,63 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._fastpath_lock = Lock()
         
     async def dispatch(self, request: Request, call_next):
-        # PERFORMANCE: Skip heavy rate limiting for fastpath endpoints
-        from middleware.utils import is_fastpath, log_middleware_skip
-        if is_fastpath(request):
-            log_middleware_skip(request, "rate_limiting", "fastpath_light_limits")
-            # Apply very light rate limiting for fastpath (just prevent abuse)
+        start_time = time.perf_counter()
+        
+        # Get request path for exempt checking
+        path = str(request.url.path)
+        
+        # AGGRESSIVE AUTH BYPASS: Skip all rate limiting for auth endpoints
+        if path.startswith('/api/v1/auth/'):
+            return await call_next(request)
+        
+        # Check if path is exempt from rate limiting
+        if self._is_exempt_path(path):
+            return await call_next(request)
+        
+        # CRITICAL: Check for fastlane flag first
+        if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+            # Apply ultra-light rate limiting for fastpath (just prevent abuse)
             client_id = self._get_client_id(request)
-            # Simple in-memory rate check without Redis (much faster)
             if not await self._fastpath_rate_check(client_id):
                 return JSONResponse(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    content={"detail": "Rate limit exceeded", "error": "rate_limit_exceeded"}
+                    content={
+                        "error": "Rate limit exceeded",
+                        "status_code": 429,
+                        "request_id": getattr(request.state, 'request_id', 'unknown'),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "path": path,
+                        "method": request.method
+                    }
                 )
             return await call_next(request)
         
+        # PERFORMANCE: Skip heavy rate limiting for fastpath endpoints
+        try:
+            from middleware.utils import is_fastpath, log_middleware_skip
+            if is_fastpath(request):
+                log_middleware_skip(request, "rate_limiting", "fastpath_light_limits")
+                # Apply very light rate limiting for fastpath (just prevent abuse)
+                client_id = self._get_client_id(request)
+                # Simple in-memory rate check without Redis (much faster)
+                if not await self._fastpath_rate_check(client_id):
+                    return JSONResponse(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        content={
+                            "error": "Rate limit exceeded",
+                            "status_code": 429,
+                            "request_id": getattr(request.state, 'request_id', 'unknown'),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "path": path,
+                            "method": request.method
+                        }
+                    )
+                return await call_next(request)
+        except ImportError:
+            pass  # utils module may not exist
+        
         # Skip rate limiting for health checks and metrics
-        if request.url.path in ["/health", "/metrics", "/api/health"]:
+        if path in ["/health", "/metrics", "/api/health", "/__version"]:
             return await call_next(request)
         
         # Check if rate limiting should be bypassed for testing (production-safe)
@@ -519,12 +586,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 logger.warning(f"Rate limit check took {rate_limit_time:.3f}s for client {client_id}")
             
             if not allowed:
-                logger.warning(f"Rate limit exceeded for client {client_id}")
+                logger.warning(f"Rate limit exceeded for client {client_id} on path {path}")
                 response = JSONResponse(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     content={
-                        "detail": "Rate limit exceeded. Please try again later.",
-                        "error": "rate_limit_exceeded"
+                        "error": "Rate limit exceeded",
+                        "status_code": 429,
+                        "request_id": getattr(request.state, 'request_id', 'unknown'),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "path": path,
+                        "method": request.method
                     }
                 )
                 # Add rate limit headers
@@ -555,6 +626,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 for key, value in headers.items():
                     response.headers[key] = value
                 
+                # PERFORMANCE: Add timing logs for slow processing
+                rate_limit_time = (time.perf_counter() - start_time) * 1000
+                if rate_limit_time > 10:  # Log if >10ms
+                    logger.warning(f"[MIDDLEWARE] RateLimit took {rate_limit_time:.2f}ms")
+                
                 return response
                 
             finally:
@@ -562,8 +638,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 await self.rate_limiter.decrement_concurrent(client_id)
                 
         except Exception as e:
-            total_time = time.time() - start_time
-            logger.error(f"Rate limiting middleware error after {total_time:.3f}s: {e}")
+            total_time = time.perf_counter() - start_time
+            logger.error(f"Rate limiting middleware error after {total_time*1000:.1f}ms: {e}")
             # If rate limiting fails completely, allow the request to proceed but log the failure
             logger.warning(f"Rate limiting bypassed due to error for client {client_id}")
             return await call_next(request)
@@ -594,7 +670,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return True
     
     def _get_client_id(self, request: Request) -> str:
-        """Get client identifier from request"""
+        """Get client identifier from request with proper proxy support"""
         # Try to get from headers first (for authenticated users)
         if hasattr(request.state, "user") and request.state.user:
             return f"user:{request.state.user.id}"
@@ -604,9 +680,35 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if client_id:
             return f"client:{client_id}"
         
-        # Fallback to IP address
+        # Extract real client IP from proxy headers
+        client_ip = self._get_real_client_ip(request)
+        return f"ip:{client_ip}"
+    
+    def _get_real_client_ip(self, request: Request) -> str:
+        """Extract real client IP from proxy headers (Railway/CloudFlare)"""
+        # Check if we should use X-Forwarded-For (configured via env)
+        if os.getenv('USE_X_FORWARDED_FOR', 'true').lower() == 'true':
+            # Railway/CloudFlare typically use X-Forwarded-For
+            forwarded_for = request.headers.get('X-Forwarded-For', '')
+            if forwarded_for:
+                # Take the first IP (original client) from comma-separated list
+                client_ip = forwarded_for.split(',')[0].strip()
+                if client_ip:
+                    return client_ip
+            
+            # Try CF-Connecting-IP (CloudFlare specific)
+            cf_ip = request.headers.get('CF-Connecting-IP', '')
+            if cf_ip:
+                return cf_ip.strip()
+            
+            # Try X-Real-IP
+            real_ip = request.headers.get('X-Real-IP', '')
+            if real_ip:
+                return real_ip.strip()
+        
+        # Fallback to direct connection IP
         if request.client:
-            return f"ip:{request.client.host}"
+            return request.client.host
         
         return "unknown"
     
@@ -622,6 +724,27 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         
         # Default to free tier
         return "free"
+    
+    def _is_exempt_path(self, path: str) -> bool:
+        """Check if path is exempt from rate limiting"""
+        # Auth endpoints that should bypass rate limiting
+        AUTH_EXEMPT_PREFIXES = (
+            "/api/v1/auth/",
+            "/auth/",
+        )
+        
+        # Check if path starts with any auth prefix
+        if any(path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES):
+            return True
+        
+        # Check environment variable for additional exempt paths
+        exempt_paths_env = os.getenv('RATE_LIMIT_EXEMPT_PATHS', '')
+        if exempt_paths_env:
+            exempt_paths = [p.strip() for p in exempt_paths_env.split(',') if p.strip()]
+            if path in exempt_paths:
+                return True
+        
+        return False
 
 
 def create_rate_limit_middleware(app):

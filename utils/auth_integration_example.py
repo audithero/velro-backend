@@ -452,4 +452,503 @@ async def get_generation_with_auth(
             }
         )
         
-    except GenerationAccessDeniedError as e:\n        # Handle generation-specific access denied errors\n        logger.warning(\n            f"🚫 [API] Generation access denied for user {current_user.id}: {e.message}",\n            extra={\n                'generation_id': generation_id,\n                'error_code': e.error_code,\n                'correlation_id': e.correlation_id\n            }\n        )\n        \n        return await handle_auth_error(\n            e, \n            user_id=str(current_user.id), \n            resource_id=generation_id, \n            resource_type="generation",\n            request=request\n        )\n    \n    except CircuitBreakerError as e:\n        # Handle circuit breaker errors\n        logger.error(\n            f"🔥 [API] Circuit breaker error for generation access: {e}",\n            extra={\n                'generation_id': generation_id,\n                'circuit_name': e.circuit_name,\n                'circuit_state': e.state.value\n            }\n        )\n        \n        return JSONResponse(\n            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,\n            content={\n                'error': True,\n                'message': 'Service temporarily unavailable. Please try again later.',\n                'error_type': 'circuit_breaker',\n                'correlation_id': getattr(request.state, 'request_id', 'unknown')\n            }\n        )\n    \n    except Exception as e:\n        # Handle unexpected errors\n        logger.error(\n            f"❌ [API] Unexpected error in generation access: {e}",\n            extra={\n                'generation_id': generation_id,\n                'user_id': str(current_user.id),\n                'error_type': type(e).__name__\n            }\n        )\n        \n        return await handle_auth_error(\n            e,\n            user_id=str(current_user.id),\n            resource_id=generation_id,\n            resource_type="generation",\n            request=request\n        )\n\n\n@auth_example_router.get("/project/{project_id}/generations")\nasync def get_project_generations_with_auth(\n    project_id: str,\n    request: Request,\n    current_user: UserResponse = Depends(get_current_user)\n):\n    """\n    Example endpoint showing project access authorization.\n    """\n    try:\n        # Authorize project access first\n        project_auth = await authorize_project_access(\n            user_id=str(current_user.id),\n            project_id=project_id,\n            action="read",\n            request=request\n        )\n        \n        # Proceed with business logic\n        project_data = {\n            'project_id': project_id,\n            'user_id': str(current_user.id),\n            'generations': [],  # Would fetch actual generations\n            'auth_info': project_auth\n        }\n        \n        return JSONResponse(\n            status_code=status.HTTP_200_OK,\n            content={\n                'success': True,\n                'data': project_data,\n                'authorization': project_auth\n            }\n        )\n        \n    except ProjectAccessDeniedError as e:\n        return await handle_auth_error(\n            e,\n            user_id=str(current_user.id),\n            resource_id=project_id,\n            resource_type="project",\n            request=request\n        )\n    \n    except Exception as e:\n        return await handle_auth_error(\n            e,\n            user_id=str(current_user.id),\n            resource_id=project_id,\n            resource_type="project",\n            request=request\n        )\n\n\n@auth_example_router.post("/token/validate")\nasync def validate_token_endpoint(\n    request: Request,\n    token: str,\n    token_type: str = "access"\n):\n    """\n    Example endpoint showing token validation.\n    """\n    try:\n        validation_result = await validate_auth_token(\n            token=token,\n            token_type=token_type,\n            request=request\n        )\n        \n        return JSONResponse(\n            status_code=status.HTTP_200_OK,\n            content={\n                'success': True,\n                'valid': validation_result.get('valid', False),\n                'user_info': {\n                    'user_id': validation_result.get('user_id'),\n                    'email': validation_result.get('email'),\n                    'role': validation_result.get('role')\n                } if validation_result.get('valid') else None\n            }\n        )\n        \n    except TokenValidationError as e:\n        return await handle_auth_error(\n            e,\n            request=request\n        )\n    \n    except Exception as e:\n        return await handle_auth_error(\n            e,\n            request=request\n        )\n\n\n@auth_example_router.get("/system/health")\nasync def get_auth_system_health_endpoint():\n    """\n    Example endpoint showing system health monitoring.\n    """\n    try:\n        health_status = await auth_system.check_system_health()\n        \n        status_code = status.HTTP_200_OK if health_status['healthy'] else status.HTTP_503_SERVICE_UNAVAILABLE\n        \n        return JSONResponse(\n            status_code=status_code,\n            content={\n                'success': health_status['healthy'],\n                'health': health_status\n            }\n        )\n        \n    except Exception as e:\n        logger.error(f"❌ [API] Error checking auth system health: {e}")\n        return JSONResponse(\n            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,\n            content={\n                'success': False,\n                'error': 'Failed to check system health',\n                'message': str(e)\n            }\n        )\n\n\n@auth_example_router.get("/system/metrics")\nasync def get_auth_system_metrics_endpoint():\n    """\n    Example endpoint showing system metrics.\n    """\n    try:\n        metrics = await auth_system.get_system_metrics()\n        \n        return JSONResponse(\n            status_code=status.HTTP_200_OK,\n            content={\n                'success': True,\n                'metrics': metrics\n            }\n        )\n        \n    except Exception as e:\n        logger.error(f"❌ [API] Error getting auth system metrics: {e}")\n        return JSONResponse(\n            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,\n            content={\n                'success': False,\n                'error': 'Failed to get system metrics',\n                'message': str(e)\n            }\n        )\n\n\n@auth_example_router.post("/system/reset")\nasync def reset_auth_system_endpoint(\n    request: Request,\n    current_user: UserResponse = Depends(get_current_user)\n):\n    """\n    Example endpoint showing system reset (admin only).\n    """\n    try:\n        # Check if user is admin\n        if current_user.role != 'admin':\n            await log_security_incident(\n                user_id=str(current_user.id),\n                violation_type='unauthorized_admin_access',\n                details={\n                    'attempted_endpoint': '/system/reset',\n                    'user_role': current_user.role\n                },\n                threat_level='medium',\n                request_context={\n                    'client_ip': request.client.host,\n                    'user_agent': request.headers.get('user-agent')\n                }\n            )\n            \n            raise HTTPException(\n                status_code=status.HTTP_403_FORBIDDEN,\n                detail="Admin access required"\n            )\n        \n        await auth_system.reset_system_state()\n        \n        logger.info(\n            f"🔄 [API] Auth system reset by admin user {current_user.id}",\n            extra={\n                'admin_user_id': str(current_user.id),\n                'admin_email': current_user.email\n            }\n        )\n        \n        return JSONResponse(\n            status_code=status.HTTP_200_OK,\n            content={\n                'success': True,\n                'message': 'Authorization system reset successfully',\n                'timestamp': auth_system.system_metrics\n            }\n        )\n        \n    except HTTPException:\n        raise\n    except Exception as e:\n        return await handle_auth_error(\n            e,\n            user_id=str(current_user.id),\n            request=request\n        )\n\n\n# Middleware integration example\nclass AuthSystemMiddleware:\n    """\n    Example middleware showing how to integrate the auth system.\n    """\n    \n    def __init__(self, app):\n        self.app = app\n    \n    async def __call__(self, scope, receive, send):\n        if scope["type"] == "http":\n            # Add request ID for correlation\n            import uuid\n            request_id = str(uuid.uuid4())\n            scope["state"] = scope.get("state", {})\n            scope["state"]["request_id"] = request_id\n            \n            # Add custom headers\n            async def send_with_headers(message):\n                if message["type"] == "http.response.start":\n                    headers = list(message.get("headers", []))\n                    headers.append([b"x-request-id", request_id.encode()])\n                    headers.append([b"x-auth-system", b"velro-uuid-auth-v1"])\n                    message["headers"] = headers\n                await send(message)\n            \n            await self.app(scope, receive, send_with_headers)\n        else:\n            await self.app(scope, receive, send)\n\n\n# Dependency injection examples\n\ndef require_generation_access(generation_id: str):\n    """\n    Dependency factory for requiring generation access.\n    """\n    async def check_access(\n        request: Request,\n        current_user: UserResponse = Depends(get_current_user)\n    ):\n        try:\n            auth_result = await authorize_generation_access(\n                user_id=str(current_user.id),\n                generation_id=generation_id,\n                action="read",\n                request=request\n            )\n            return auth_result\n        except Exception as e:\n            # Convert to HTTPException for FastAPI\n            if isinstance(e, GenerationAccessDeniedError):\n                raise HTTPException(\n                    status_code=status.HTTP_403_FORBIDDEN,\n                    detail=e.user_message\n                )\n            else:\n                raise HTTPException(\n                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,\n                    detail="Authorization check failed"\n                )\n    \n    return check_access\n\n\ndef require_project_access(project_id: str, action: str = "read"):\n    """\n    Dependency factory for requiring project access.\n    """\n    async def check_access(\n        request: Request,\n        current_user: UserResponse = Depends(get_current_user)\n    ):\n        try:\n            auth_result = await authorize_project_access(\n                user_id=str(current_user.id),\n                project_id=project_id,\n                action=action,\n                request=request\n            )\n            return auth_result\n        except Exception as e:\n            if isinstance(e, ProjectAccessDeniedError):\n                raise HTTPException(\n                    status_code=status.HTTP_403_FORBIDDEN,\n                    detail=e.user_message\n                )\n            else:\n                raise HTTPException(\n                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,\n                    detail="Authorization check failed"\n                )\n    \n    return check_access\n\n\n# Example usage with dependency\n@auth_example_router.get("/generation/{generation_id}/secure")\nasync def get_generation_with_dependency(\n    generation_id: str,\n    auth_result = Depends(require_generation_access)\n):\n    """\n    Example showing dependency-based authorization.\n    """\n    return {\n        'success': True,\n        'generation_id': generation_id,\n        'authorized': True,\n        'auth_info': auth_result\n    }\n\n\n# Configuration examples\ndef create_production_auth_config() -> AuthSystemConfig:\n    """\n    Create production-ready auth system configuration.\n    """\n    return AuthSystemConfig(\n        enable_circuit_breakers=True,\n        enable_detailed_logging=True,\n        enable_security_monitoring=True,\n        enable_performance_monitoring=True,\n        enable_fallback_strategies=True,\n        database_timeout=5.0,  # Shorter timeout for production\n        external_auth_timeout=10.0,\n        token_validation_timeout=3.0,\n        max_failed_attempts_per_minute=20,  # Higher threshold for production\n        max_failed_attempts_per_hour=200,\n        security_violation_threshold=10,\n        slow_operation_threshold_ms=500.0,  # Lower threshold for production\n        cache_ttl_seconds=600,\n        metrics_retention_hours=48\n    )\n\n\ndef create_development_auth_config() -> AuthSystemConfig:\n    """\n    Create development-friendly auth system configuration.\n    """\n    return AuthSystemConfig(\n        enable_circuit_breakers=False,  # Disabled for easier debugging\n        enable_detailed_logging=True,\n        enable_security_monitoring=False,  # Less strict in development\n        enable_performance_monitoring=True,\n        enable_fallback_strategies=False,\n        database_timeout=30.0,  # Longer timeout for debugging\n        external_auth_timeout=30.0,\n        token_validation_timeout=10.0,\n        max_failed_attempts_per_minute=100,  # More lenient\n        max_failed_attempts_per_hour=1000,\n        security_violation_threshold=50,\n        slow_operation_threshold_ms=2000.0,  # Higher threshold\n        cache_ttl_seconds=60,  # Shorter cache for development\n        metrics_retention_hours=24\n    )\n\n\n# Integration with FastAPI app\ndef setup_auth_system_for_app(app, config: Optional[AuthSystemConfig] = None):\n    """\n    Setup the authorization system for a FastAPI app.\n    """\n    # Configure the global auth system\n    if config:\n        global auth_system\n        auth_system = UUIDAuthorizationSystem(config)\n    \n    # Add middleware\n    app.add_middleware(AuthSystemMiddleware)\n    \n    # Add exception handlers\n    @app.exception_handler(GenerationAccessDeniedError)\n    async def generation_access_denied_handler(request: Request, exc: GenerationAccessDeniedError):\n        return await handle_auth_error(\n            exc,\n            resource_id=exc.generation_id,\n            resource_type="generation",\n            request=request\n        )\n    \n    @app.exception_handler(ProjectAccessDeniedError)\n    async def project_access_denied_handler(request: Request, exc: ProjectAccessDeniedError):\n        return await handle_auth_error(\n            exc,\n            resource_id=exc.project_id,\n            resource_type="project",\n            request=request\n        )\n    \n    @app.exception_handler(UUIDAuthorizationError)\n    async def uuid_auth_error_handler(request: Request, exc: UUIDAuthorizationError):\n        return await handle_auth_error(\n            exc,\n            resource_id=exc.uuid_value,\n            resource_type=exc.uuid_type,\n            request=request\n        )\n    \n    @app.exception_handler(CircuitBreakerError)\n    async def circuit_breaker_error_handler(request: Request, exc: CircuitBreakerError):\n        return JSONResponse(\n            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,\n            content={\n                'error': True,\n                'message': 'Service temporarily unavailable due to system protection.',\n                'error_type': 'circuit_breaker',\n                'circuit_name': exc.circuit_name,\n                'retry_after': 60\n            }\n        )\n    \n    # Add startup event to initialize auth system\n    @app.on_event("startup")\n    async def startup_auth_system():\n        logger.info("🚀 [STARTUP] Initializing authorization system")\n        health = await auth_system.check_system_health()\n        logger.info(f"✅ [STARTUP] Auth system health: {health['healthy']}")\n    \n    # Add shutdown event to cleanup\n    @app.on_event("shutdown")\n    async def shutdown_auth_system():\n        logger.info("🔄 [SHUTDOWN] Cleaning up authorization system")\n        await auth_system.reset_system_state()\n        logger.info("✅ [SHUTDOWN] Auth system cleanup complete")\n    \n    logger.info("✅ [SETUP] Authorization system setup complete")
+    except GenerationAccessDeniedError as e:
+        # Handle generation-specific access denied errors
+        logger.warning(
+            f"🚫 [API] Generation access denied for user {current_user.id}: {e.message}",
+            extra={
+                'generation_id': generation_id,
+                'error_code': e.error_code,
+                'correlation_id': e.correlation_id
+            }
+        )
+        
+        return await handle_auth_error(
+            e, 
+            user_id=str(current_user.id), 
+            resource_id=generation_id, 
+            resource_type="generation",
+            request=request
+        )
+    
+    except CircuitBreakerError as e:
+        # Handle circuit breaker errors
+        logger.error(
+            f"🔥 [API] Circuit breaker error for generation access: {e}",
+            extra={
+                'generation_id': generation_id,
+                'circuit_name': e.circuit_name,
+                'circuit_state': e.state.value
+            }
+        )
+        
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                'error': True,
+                'message': 'Service temporarily unavailable. Please try again later.',
+                'error_type': 'circuit_breaker',
+                'correlation_id': getattr(request.state, 'request_id', 'unknown')
+            }
+        )
+    
+    except Exception as e:
+        # Handle unexpected errors
+        logger.error(
+            f"❌ [API] Unexpected error in generation access: {e}",
+            extra={
+                'generation_id': generation_id,
+                'user_id': str(current_user.id),
+                'error_type': type(e).__name__
+            }
+        )
+        
+        return await handle_auth_error(
+            e,
+            user_id=str(current_user.id),
+            resource_id=generation_id,
+            resource_type="generation",
+            request=request
+        )
+
+
+@auth_example_router.get("/project/{project_id}/generations")
+async def get_project_generations_with_auth(
+    project_id: str,
+    request: Request,
+    current_user: UserResponse = Depends(get_current_user)
+):
+    """
+    Example endpoint showing project access authorization.
+    """
+    try:
+        # Authorize project access first
+        project_auth = await authorize_project_access(
+            user_id=str(current_user.id),
+            project_id=project_id,
+            action="read",
+            request=request
+        )
+        
+        # Proceed with business logic
+        project_data = {
+            'project_id': project_id,
+            'user_id': str(current_user.id),
+            'generations': [],  # Would fetch actual generations
+            'auth_info': project_auth
+        }
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                'success': True,
+                'data': project_data,
+                'authorization': project_auth
+            }
+        )
+        
+    except ProjectAccessDeniedError as e:
+        return await handle_auth_error(
+            e,
+            user_id=str(current_user.id),
+            resource_id=project_id,
+            resource_type="project",
+            request=request
+        )
+    
+    except Exception as e:
+        return await handle_auth_error(
+            e,
+            user_id=str(current_user.id),
+            resource_id=project_id,
+            resource_type="project",
+            request=request
+        )
+
+
+@auth_example_router.post("/token/validate")
+async def validate_token_endpoint(
+    request: Request,
+    token: str,
+    token_type: str = "access"
+):
+    """
+    Example endpoint showing token validation.
+    """
+    try:
+        validation_result = await validate_auth_token(
+            token=token,
+            token_type=token_type,
+            request=request
+        )
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                'success': True,
+                'valid': validation_result.get('valid', False),
+                'user_info': {
+                    'user_id': validation_result.get('user_id'),
+                    'email': validation_result.get('email'),
+                    'role': validation_result.get('role')
+                } if validation_result.get('valid') else None
+            }
+        )
+        
+    except TokenValidationError as e:
+        return await handle_auth_error(
+            e,
+            request=request
+        )
+    
+    except Exception as e:
+        return await handle_auth_error(
+            e,
+            request=request
+        )
+
+
+@auth_example_router.get("/system/health")
+async def get_auth_system_health_endpoint():
+    """
+    Example endpoint showing system health monitoring.
+    """
+    try:
+        health_status = await auth_system.check_system_health()
+        
+        status_code = status.HTTP_200_OK if health_status['healthy'] else status.HTTP_503_SERVICE_UNAVAILABLE
+        
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                'success': health_status['healthy'],
+                'health': health_status
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [API] Error checking auth system health: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                'success': False,
+                'error': 'Failed to check system health',
+                'message': str(e)
+            }
+        )
+
+
+@auth_example_router.get("/system/metrics")
+async def get_auth_system_metrics_endpoint():
+    """
+    Example endpoint showing system metrics.
+    """
+    try:
+        metrics = await auth_system.get_system_metrics()
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                'success': True,
+                'metrics': metrics
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ [API] Error getting auth system metrics: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                'success': False,
+                'error': 'Failed to get system metrics',
+                'message': str(e)
+            }
+        )
+
+
+@auth_example_router.post("/system/reset")
+async def reset_auth_system_endpoint(
+    request: Request,
+    current_user: UserResponse = Depends(get_current_user)
+):
+    """
+    Example endpoint showing system reset (admin only).
+    """
+    try:
+        # Check if user is admin
+        if current_user.role != 'admin':
+            await log_security_incident(
+                user_id=str(current_user.id),
+                violation_type='unauthorized_admin_access',
+                details={
+                    'attempted_endpoint': '/system/reset',
+                    'user_role': current_user.role
+                },
+                threat_level='medium',
+                request_context={
+                    'client_ip': request.client.host,
+                    'user_agent': request.headers.get('user-agent')
+                }
+            )
+            
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin access required"
+            )
+        
+        await auth_system.reset_system_state()
+        
+        logger.info(
+            f"🔄 [API] Auth system reset by admin user {current_user.id}",
+            extra={
+                'admin_user_id': str(current_user.id),
+                'admin_email': current_user.email
+            }
+        )
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                'success': True,
+                'message': 'Authorization system reset successfully',
+                'timestamp': auth_system.system_metrics
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        return await handle_auth_error(
+            e,
+            user_id=str(current_user.id),
+            request=request
+        )
+
+
+# Middleware integration example
+class AuthSystemMiddleware:
+    """
+    Example middleware showing how to integrate the auth system.
+    """
+    
+    def __init__(self, app):
+        self.app = app
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Add request ID for correlation
+            import uuid
+            request_id = str(uuid.uuid4())
+            scope["state"] = scope.get("state", {})
+            scope["state"]["request_id"] = request_id
+            
+            # Add custom headers
+            async def send_with_headers(message):
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers", []))
+                    headers.append([b"x-request-id", request_id.encode()])
+                    headers.append([b"x-auth-system", b"velro-uuid-auth-v1"])
+                    message["headers"] = headers
+                await send(message)
+            
+            await self.app(scope, receive, send_with_headers)
+        else:
+            await self.app(scope, receive, send)
+
+
+# Dependency injection examples
+
+def require_generation_access(generation_id: str):
+    """
+    Dependency factory for requiring generation access.
+    """
+    async def check_access(
+        request: Request,
+        current_user: UserResponse = Depends(get_current_user)
+    ):
+        try:
+            auth_result = await authorize_generation_access(
+                user_id=str(current_user.id),
+                generation_id=generation_id,
+                action="read",
+                request=request
+            )
+            return auth_result
+        except Exception as e:
+            # Convert to HTTPException for FastAPI
+            if isinstance(e, GenerationAccessDeniedError):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=e.user_message
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Authorization check failed"
+                )
+    
+    return check_access
+
+
+def require_project_access(project_id: str, action: str = "read"):
+    """
+    Dependency factory for requiring project access.
+    """
+    async def check_access(
+        request: Request,
+        current_user: UserResponse = Depends(get_current_user)
+    ):
+        try:
+            auth_result = await authorize_project_access(
+                user_id=str(current_user.id),
+                project_id=project_id,
+                action=action,
+                request=request
+            )
+            return auth_result
+        except Exception as e:
+            if isinstance(e, ProjectAccessDeniedError):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=e.user_message
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Authorization check failed"
+                )
+    
+    return check_access
+
+
+# Example usage with dependency
+@auth_example_router.get("/generation/{generation_id}/secure")
+async def get_generation_with_dependency(
+    generation_id: str,
+    auth_result = Depends(require_generation_access)
+):
+    """
+    Example showing dependency-based authorization.
+    """
+    return {
+        'success': True,
+        'generation_id': generation_id,
+        'authorized': True,
+        'auth_info': auth_result
+    }
+
+
+# Configuration examples
+def create_production_auth_config() -> AuthSystemConfig:
+    """
+    Create production-ready auth system configuration.
+    """
+    return AuthSystemConfig(
+        enable_circuit_breakers=True,
+        enable_detailed_logging=True,
+        enable_security_monitoring=True,
+        enable_performance_monitoring=True,
+        enable_fallback_strategies=True,
+        database_timeout=5.0,  # Shorter timeout for production
+        external_auth_timeout=10.0,
+        token_validation_timeout=3.0,
+        max_failed_attempts_per_minute=20,  # Higher threshold for production
+        max_failed_attempts_per_hour=200,
+        security_violation_threshold=10,
+        slow_operation_threshold_ms=500.0,  # Lower threshold for production
+        cache_ttl_seconds=600,
+        metrics_retention_hours=48
+    )
+
+
+def create_development_auth_config() -> AuthSystemConfig:
+    """
+    Create development-friendly auth system configuration.
+    """
+    return AuthSystemConfig(
+        enable_circuit_breakers=False,  # Disabled for easier debugging
+        enable_detailed_logging=True,
+        enable_security_monitoring=False,  # Less strict in development
+        enable_performance_monitoring=True,
+        enable_fallback_strategies=False,
+        database_timeout=30.0,  # Longer timeout for debugging
+        external_auth_timeout=30.0,
+        token_validation_timeout=10.0,
+        max_failed_attempts_per_minute=100,  # More lenient
+        max_failed_attempts_per_hour=1000,
+        security_violation_threshold=50,
+        slow_operation_threshold_ms=2000.0,  # Higher threshold
+        cache_ttl_seconds=60,  # Shorter cache for development
+        metrics_retention_hours=24
+    )
+
+
+# Integration with FastAPI app
+def setup_auth_system_for_app(app, config: Optional[AuthSystemConfig] = None):
+    """
+    Setup the authorization system for a FastAPI app.
+    """
+    # Configure the global auth system
+    if config:
+        global auth_system
+        auth_system = UUIDAuthorizationSystem(config)
+    
+    # Add middleware
+    app.add_middleware(AuthSystemMiddleware)
+    
+    # Add exception handlers
+    @app.exception_handler(GenerationAccessDeniedError)
+    async def generation_access_denied_handler(request: Request, exc: GenerationAccessDeniedError):
+        return await handle_auth_error(
+            exc,
+            resource_id=exc.generation_id,
+            resource_type="generation",
+            request=request
+        )
+    
+    @app.exception_handler(ProjectAccessDeniedError)
+    async def project_access_denied_handler(request: Request, exc: ProjectAccessDeniedError):
+        return await handle_auth_error(
+            exc,
+            resource_id=exc.project_id,
+            resource_type="project",
+            request=request
+        )
+    
+    @app.exception_handler(UUIDAuthorizationError)
+    async def uuid_auth_error_handler(request: Request, exc: UUIDAuthorizationError):
+        return await handle_auth_error(
+            exc,
+            resource_id=exc.uuid_value,
+            resource_type=exc.uuid_type,
+            request=request
+        )
+    
+    @app.exception_handler(CircuitBreakerError)
+    async def circuit_breaker_error_handler(request: Request, exc: CircuitBreakerError):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                'error': True,
+                'message': 'Service temporarily unavailable due to system protection.',
+                'error_type': 'circuit_breaker',
+                'circuit_name': exc.circuit_name,
+                'retry_after': 60
+            }
+        )
+    
+    # Add startup event to initialize auth system
+    @app.on_event("startup")
+    async def startup_auth_system():
+        logger.info("🚀 [STARTUP] Initializing authorization system")
+        health = await auth_system.check_system_health()
+        logger.info(f"✅ [STARTUP] Auth system health: {health['healthy']}")
+    
+    # Add shutdown event to cleanup
+    @app.on_event("shutdown")
+    async def shutdown_auth_system():
+        logger.info("🔄 [SHUTDOWN] Cleaning up authorization system")
+        await auth_system.reset_system_state()
+        logger.info("✅ [SHUTDOWN] Auth system cleanup complete")
+    
+    logger.info("✅ [SETUP] Authorization system setup complete")

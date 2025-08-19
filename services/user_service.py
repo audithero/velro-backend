@@ -28,7 +28,10 @@ class UserService:
         """Initialize repositories if not already done."""
         if self.db is None:
             self.db = await get_database()
-            self.user_repo = UserRepository(self.db)
+            # CRITICAL FIX: UserRepository now requires supabase_client as second argument
+            from database import SupabaseClient
+            supabase_client = SupabaseClient()
+            self.user_repo = UserRepository(self.db, supabase_client)
             self.credit_repo = CreditRepository(self.db)
     
     async def get_user_profile(self, user_id: str) -> UserResponse:

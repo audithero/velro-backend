@@ -171,6 +171,11 @@ class SecureDesignMiddleware(BaseHTTPMiddleware):
         start_time = time.time()
         
         try:
+            # CRITICAL FIX: Check for fastlane flag first
+            if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+                logger.debug(f"⚡ [SECURE-DESIGN] Fastlane bypass for {request.url.path}")
+                return await call_next(request)
+            
             # CRITICAL FIX: Check for fast-lane processing to prevent deadlocks
             try:
                 from middleware.production_optimized import BodyCacheHelper

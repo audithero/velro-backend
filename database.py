@@ -210,6 +210,32 @@ class SupabaseClient:
                 # Support both old JWT service_role_key and new sb_secret format
                 service_key = settings.get_service_key.strip()
                 
+                # CRITICAL FIX: Pre-validate service key with actual API call before creating client
+                logger.info("🔍 [DATABASE] Pre-validating service key with Supabase API...")
+                
+                # Quick test to check if service key is actually valid before creating client
+                try:
+                    import httpx
+                    test_response = httpx.get(
+                        f"{settings.supabase_url}/rest/v1/",
+                        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+                        timeout=5.0
+                    )
+                    if test_response.status_code == 401:
+                        logger.error("❌ [DATABASE] Service key failed API validation - key is invalid/expired")
+                        logger.error("🔧 [DATABASE] SOLUTION: Regenerate SUPABASE_SERVICE_ROLE_KEY in Supabase dashboard")
+                        logger.error("🔄 [DATABASE] FALLBACK: Will skip service client creation and use anon client only")
+                        self._service_key_valid = False
+                        self._service_client = None
+                        return  # Skip service client creation entirely
+                    elif test_response.status_code in [200, 404]:  # 200 or 404 both indicate valid auth
+                        logger.info("✅ [DATABASE] Service key passed API pre-validation")
+                    else:
+                        logger.warning(f"⚠️ [DATABASE] Service key pre-validation returned {test_response.status_code}")
+                except Exception as pre_validate_error:
+                    logger.warning(f"⚠️ [DATABASE] Service key pre-validation failed: {pre_validate_error}")
+                    logger.warning("🔄 [DATABASE] Will attempt service client creation anyway")
+                
                 # Validate service key format with enhanced detection
                 if self._validate_service_key_format(service_key):
                     logger.info("✅ [DATABASE] Service key format validated successfully")

@@ -14,6 +14,7 @@ This module addresses OWASP Top 10 2021 A10: SSRF by implementing:
 
 import logging
 import re
+import time
 import ipaddress
 import socket
 from typing import Dict, List, Optional, Set, Tuple, Any
@@ -151,11 +152,23 @@ class SSRFProtectionMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         """Apply SSRF protection to all requests with deadlock prevention."""
-        # CRITICAL PERFORMANCE FIX: Skip SSRF for auth endpoints completely
-        # Auth endpoints don't make external requests - no SSRF risk
+        start_time = time.perf_counter()
+        
+        # OPTIONS requests must pass through for CORS preflight
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        
+        # AGGRESSIVE AUTH BYPASS: Skip all SSRF processing for auth endpoints
         path = str(request.url.path)
-        if path.startswith('/api/v1/auth') or path == '/health':
-            logger.debug(f"⚡ [SSRF-PROTECTION] Bypassing for auth/health endpoint: {path}")
+        if path.startswith('/api/v1/auth/'):
+            return await call_next(request)
+        
+        # CRITICAL: Check for fastlane flag from FastlaneAuthMiddleware first
+        if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+            return await call_next(request)
+        
+        # Skip for health and other internal endpoints that don't make external calls
+        if path in ['/health', '/healthz', '/ping']:
             return await call_next(request)
         
         # Skip for other internal endpoints that don't make external calls
@@ -191,6 +204,11 @@ class SSRFProtectionMiddleware(BaseHTTPMiddleware):
             # Step 4: Log successful URL access (if analysis completed)
             if 'url_analysis' in locals() and url_analysis.get('urls_found'):
                 await self._log_url_access(request, url_analysis, success=True)
+            
+            # PERFORMANCE: Add timing logs for slow processing
+            elapsed = (time.perf_counter() - start_time) * 1000
+            if elapsed > 10:  # Log if >10ms
+                logger.warning(f"[MIDDLEWARE] SSRF protection took {elapsed:.2f}ms")
             
             return response
             

@@ -109,6 +109,15 @@ class ProductionOptimizedMiddleware(BaseHTTPMiddleware):
         self.performance_stats['total_requests'] += 1
         
         try:
+            # CRITICAL: Check for fastlane flag from FastlaneAuthMiddleware first
+            if hasattr(request.state, 'is_fastlane') and request.state.is_fastlane:
+                logger.debug(f"⚡ [PROD-OPTIMIZED] Fastlane bypass for {path}")
+                response = await call_next(request)
+                processing_time = (time.time() - start_time) * 1000
+                response.headers["X-Processing-Time"] = f"{processing_time:.2f}ms"
+                response.headers["X-Fastlane-Bypass"] = "true"
+                return response
+            
             # CRITICAL: Fast-lane processing for auth endpoints
             if self._is_fast_lane_endpoint(path):
                 self.performance_stats['fast_lane_requests'] += 1

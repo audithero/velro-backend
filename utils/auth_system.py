@@ -265,4 +265,555 @@ class UUIDAuthorizationSystem:
             processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             await self._update_system_metrics(False, processing_time)
             
-            if isinstance(e, (UUIDAuthorizationError, ProjectAccessDeniedError)):\n                raise e\n            else:\n                auth_error = ProjectAccessDeniedError(\n                    project_id=project_id,\n                    user_id=user_id,\n                    details={'original_error': str(e), 'error_type': type(e).__name__}\n                )\n                raise auth_error\n    \n    async def validate_token(\n        self,\n        token: str,\n        token_type: str = "access",\n        request: Optional[Request] = None\n    ) -> Dict[str, Any]:\n        """Validate authentication token with comprehensive error handling."""\n        start_time = datetime.now(timezone.utc)\n        \n        try:\n            if self.config.enable_circuit_breakers:\n                validation_result = await self._authorize_with_circuit_breaker(\n                    self._perform_token_validation,\n                    token,\n                    token_type\n                )\n            else:\n                validation_result = await self._perform_token_validation(token, token_type)\n            \n            processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000\n            \n            # Log successful validation\n            if self.config.enable_detailed_logging:\n                await log_token_validation_attempt(\n                    validation_result.get('user_id'),\n                    token_type,\n                    'valid',\n                    {'processing_time_ms': processing_time},\n                    AuthLogMetrics(processing_time_ms=processing_time)\n                )\n            \n            await self._update_system_metrics(True, processing_time)\n            \n            return validation_result\n            \n        except Exception as e:\n            processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000\n            \n            # Log failed validation\n            if self.config.enable_detailed_logging:\n                await log_token_validation_attempt(\n                    None,\n                    token_type,\n                    'invalid',\n                    {'error': str(e), 'processing_time_ms': processing_time},\n                    AuthLogMetrics(processing_time_ms=processing_time)\n                )\n            \n            await self._update_system_metrics(False, processing_time)\n            \n            if isinstance(e, TokenValidationError):\n                raise e\n            else:\n                token_error = TokenValidationError(\n                    f"Token validation failed: {str(e)}",\n                    token_type=token_type,\n                    validation_failure_reason=str(e)\n                )\n                raise token_error\n    \n    async def handle_authorization_error(\n        self,\n        error: Union[Exception, HTTPException],\n        user_id: Optional[str] = None,\n        resource_id: Optional[str] = None,\n        resource_type: Optional[str] = None,\n        request: Optional[Request] = None\n    ) -> JSONResponse:\n        """Handle authorization errors with comprehensive error response."""\n        \n        context = AuthErrorContext(\n            user_id=user_id,\n            resource_id=resource_id,\n            resource_type=resource_type,\n            correlation_id=str(uuid.uuid4())\n        )\n        \n        if request:\n            context.client_ip = self._get_client_ip(request)\n            context.user_agent = request.headers.get('user-agent')\n            context.request_path = str(request.url.path)\n            context.request_method = request.method\n            context.request_id = getattr(request.state, 'request_id', None)\n        \n        return await self.error_handler.handle_authorization_error(\n            error, context, request\n        )\n    \n    async def check_system_health(self) -> Dict[str, Any]:\n        """Check the health of the authorization system."""\n        \n        health_status = {\n            'healthy': self.is_healthy,\n            'maintenance_mode': self.maintenance_mode,\n            'timestamp': datetime.now(timezone.utc).isoformat(),\n            'system_metrics': self.system_metrics.copy(),\n            'circuit_breakers': {},\n            'subsystem_health': {\n                'error_handler': True,\n                'logger': True,\n                'circuit_breakers': True,\n                'uuid_utils': True\n            }\n        }\n        \n        # Check circuit breaker health\n        if self.config.enable_circuit_breakers:\n            cb_states = self.circuit_breaker_manager.get_all_states()\n            health_status['circuit_breakers'] = cb_states\n            \n            # System is unhealthy if critical circuit breakers are open\n            critical_breakers = ['database', 'token_validation']\n            for cb_name in critical_breakers:\n                if cb_name in cb_states and cb_states[cb_name]['state'] == 'open':\n                    self.is_healthy = False\n                    health_status['healthy'] = False\n                    health_status['issues'] = health_status.get('issues', [])\n                    health_status['issues'].append(f'Critical circuit breaker {cb_name} is open')\n        \n        return health_status\n    \n    async def get_system_metrics(self) -> Dict[str, Any]:\n        """Get comprehensive system metrics."""\n        \n        metrics = {\n            'timestamp': datetime.now(timezone.utc).isoformat(),\n            'system_metrics': self.system_metrics.copy(),\n            'circuit_breakers': self.circuit_breaker_manager.get_all_states(),\n            'configuration': {\n                'enable_circuit_breakers': self.config.enable_circuit_breakers,\n                'enable_detailed_logging': self.config.enable_detailed_logging,\n                'enable_security_monitoring': self.config.enable_security_monitoring,\n                'enable_performance_monitoring': self.config.enable_performance_monitoring\n            }\n        }\n        \n        return metrics\n    \n    async def reset_system_state(self):\n        """Reset the authorization system to initial state."""\n        \n        logger.info("🔄 [AUTH-SYSTEM] Resetting system state")\n        \n        # Reset circuit breakers\n        if self.config.enable_circuit_breakers:\n            await self.circuit_breaker_manager.reset_all()\n        \n        # Reset system metrics\n        self.system_metrics = {\n            'total_requests': 0,\n            'successful_requests': 0,\n            'failed_requests': 0,\n            'average_response_time': 0.0,\n            'error_rate': 0.0\n        }\n        \n        # Reset health status\n        self.is_healthy = True\n        self.maintenance_mode = False\n        \n        logger.info("✅ [AUTH-SYSTEM] System state reset complete")\n    \n    def _create_auth_context(\n        self,\n        user_id: str,\n        resource_id: str,\n        resource_type: str,\n        action: str,\n        request: Optional[Request]\n    ) -> AuthLogContext:\n        """Create authorization context for logging."""\n        \n        context = AuthLogContext(\n            user_id=user_id,\n            resource_id=resource_id,\n            resource_type=resource_type,\n            action=action\n        )\n        \n        if request:\n            context.client_ip = self._get_client_ip(request)\n            context.user_agent = request.headers.get('user-agent')\n            context.request_path = str(request.url.path)\n            context.request_method = request.method\n            context.session_id = getattr(request.state, 'session_id', None)\n            context.request_id = getattr(request.state, 'request_id', None)\n        \n        return context\n    \n    def _extract_request_context(self, request: Optional[Request]) -> Optional[Dict[str, Any]]:\n        """Extract request context for logging."""\n        \n        if not request:\n            return None\n        \n        return {\n            'client_ip': self._get_client_ip(request),\n            'user_agent': request.headers.get('user-agent'),\n            'request_path': str(request.url.path),\n            'request_method': request.method,\n            'session_id': getattr(request.state, 'session_id', None),\n            'request_id': getattr(request.state, 'request_id', None)\n        }\n    \n    def _get_client_ip(self, request: Request) -> str:\n        """Extract client IP from request."""\n        forwarded_for = request.headers.get('x-forwarded-for')\n        if forwarded_for:\n            return forwarded_for.split(',')[0].strip()\n        \n        real_ip = request.headers.get('x-real-ip')\n        if real_ip:\n            return real_ip\n        \n        return request.client.host if request.client else 'unknown'\n    \n    async def _authorize_with_circuit_breaker(self, func: Callable, *args, **kwargs):\n        """Execute authorization function with circuit breaker protection."""\n        \n        # Determine circuit breaker based on function\n        if func.__name__ == '_perform_token_validation':\n            cb_name = 'token_validation'\n        elif func.__name__ in ['_check_generation_ownership', '_check_project_access']:\n            cb_name = 'database'\n        else:\n            cb_name = 'external_auth'\n        \n        cb = self.circuit_breaker_manager.get_circuit_breaker(cb_name)\n        return await cb.call(func, *args, **kwargs)\n    \n    async def _check_generation_ownership(\n        self,\n        user_id: uuid.UUID,\n        generation_id: uuid.UUID,\n        action: str\n    ) -> Dict[str, Any]:\n        """Check if user owns or has access to the generation."""\n        \n        # This would implement actual database lookup\n        # For now, simulating the check\n        \n        try:\n            from database import SupabaseClient\n            db_client = SupabaseClient()\n            \n            if not db_client.is_available():\n                raise DatabaseError("Database is not available")\n            \n            # Query generation ownership\n            result = db_client.service_client.table('generations').select('user_id, created_by').eq('id', str(generation_id)).execute()\n            \n            if not result.data:\n                raise GenerationAccessDeniedError(\n                    generation_id=str(generation_id),\n                    user_id=str(user_id),\n                    details={'reason': 'Generation not found'}\n                )\n            \n            generation_data = result.data[0]\n            owner_id = generation_data.get('user_id') or generation_data.get('created_by')\n            \n            if str(owner_id) != str(user_id):\n                # Log ownership verification\n                if self.config.enable_detailed_logging:\n                    await log_ownership_verification(\n                        str(user_id),\n                        str(generation_id),\n                        'generation',\n                        str(owner_id),\n                        False\n                    )\n                \n                raise GenerationAccessDeniedError(\n                    generation_id=str(generation_id),\n                    user_id=str(user_id),\n                    owner_id=str(owner_id),\n                    details={'reason': 'Ownership check failed'}\n                )\n            \n            # Log successful ownership verification\n            if self.config.enable_detailed_logging:\n                await log_ownership_verification(\n                    str(user_id),\n                    str(generation_id),\n                    'generation',\n                    str(owner_id),\n                    True\n                )\n            \n            return {\n                'authorized': True,\n                'owner_id': str(owner_id),\n                'resource_type': 'generation',\n                'action': action\n            }\n            \n        except Exception as e:\n            if isinstance(e, GenerationAccessDeniedError):\n                raise e\n            else:\n                logger.error(f"❌ [AUTH-SYSTEM] Generation ownership check failed: {e}")\n                raise GenerationAccessDeniedError(\n                    generation_id=str(generation_id),\n                    user_id=str(user_id),\n                    details={'error': str(e), 'check_type': 'database_error'}\n                )\n    \n    async def _check_project_access(\n        self,\n        user_id: uuid.UUID,\n        project_id: uuid.UUID,\n        action: str\n    ) -> Dict[str, Any]:\n        """Check if user has access to the project."""\n        \n        try:\n            from database import SupabaseClient\n            db_client = SupabaseClient()\n            \n            if not db_client.is_available():\n                raise DatabaseError("Database is not available")\n            \n            # Check project membership or ownership\n            project_result = db_client.service_client.table('projects').select('user_id, team_id').eq('id', str(project_id)).execute()\n            \n            if not project_result.data:\n                raise ProjectAccessDeniedError(\n                    project_id=str(project_id),\n                    user_id=str(user_id),\n                    details={'reason': 'Project not found'}\n                )\n            \n            project_data = project_result.data[0]\n            project_owner = project_data.get('user_id')\n            team_id = project_data.get('team_id')\n            \n            # Check if user is project owner\n            if str(project_owner) == str(user_id):\n                return {\n                    'authorized': True,\n                    'access_type': 'owner',\n                    'project_id': str(project_id)\n                }\n            \n            # Check team membership if project has a team\n            if team_id:\n                team_result = db_client.service_client.table('team_members').select('user_id').eq('team_id', str(team_id)).eq('user_id', str(user_id)).execute()\n                \n                if team_result.data:\n                    return {\n                        'authorized': True,\n                        'access_type': 'team_member',\n                        'project_id': str(project_id),\n                        'team_id': str(team_id)\n                    }\n            \n            # No access found\n            raise ProjectAccessDeniedError(\n                project_id=str(project_id),\n                user_id=str(user_id),\n                details={'reason': 'No access permission found'}\n            )\n            \n        except Exception as e:\n            if isinstance(e, ProjectAccessDeniedError):\n                raise e\n            else:\n                logger.error(f"❌ [AUTH-SYSTEM] Project access check failed: {e}")\n                raise ProjectAccessDeniedError(\n                    project_id=str(project_id),\n                    user_id=str(user_id),\n                    details={'error': str(e), 'check_type': 'database_error'}\n                )\n    \n    async def _perform_token_validation(\n        self,\n        token: str,\n        token_type: str\n    ) -> Dict[str, Any]:\n        """Perform token validation with comprehensive error handling."""\n        \n        try:\n            # Import auth middleware for token validation\n            from middleware.auth import AuthMiddleware\n            \n            # Create temporary middleware instance for validation\n            auth_middleware = AuthMiddleware(app=None)\n            user = await auth_middleware._verify_token(token)\n            \n            return {\n                'valid': True,\n                'user_id': str(user.id),\n                'email': user.email,\n                'role': user.role,\n                'token_type': token_type\n            }\n            \n        except HTTPException as e:\n            if e.status_code == 401:\n                raise TokenValidationError(\n                    f"Token validation failed: {e.detail}",\n                    token_type=token_type,\n                    validation_failure_reason=str(e.detail)\n                )\n            else:\n                raise e\n        except Exception as e:\n            logger.error(f"❌ [AUTH-SYSTEM] Token validation error: {e}")\n            raise TokenValidationError(\n                f"Token validation failed: {str(e)}",\n                token_type=token_type,\n                validation_failure_reason=str(e)\n            )\n    \n    async def _update_system_metrics(self, success: bool, processing_time_ms: float):\n        """Update system-level metrics."""\n        \n        self.system_metrics['total_requests'] += 1\n        \n        if success:\n            self.system_metrics['successful_requests'] += 1\n        else:\n            self.system_metrics['failed_requests'] += 1\n        \n        # Update average response time\n        total_requests = self.system_metrics['total_requests']\n        current_avg = self.system_metrics['average_response_time']\n        self.system_metrics['average_response_time'] = (\n            (current_avg * (total_requests - 1) + processing_time_ms) / total_requests\n        )\n        \n        # Update error rate\n        self.system_metrics['error_rate'] = (\n            self.system_metrics['failed_requests'] / total_requests\n        ) * 100\n        \n        # Log slow operations\n        if (self.config.enable_performance_monitoring and \n            processing_time_ms > self.config.slow_operation_threshold_ms):\n            \n            logger.warning(\n                f"🐌 [AUTH-SYSTEM] Slow authorization operation: {processing_time_ms:.2f}ms"\n            )\n    \n    # Fallback functions for circuit breakers\n    \n    async def _database_fallback(self, *args, **kwargs):\n        """Fallback for database operations."""\n        logger.warning("🔄 [AUTH-SYSTEM] Using database fallback - denying access for security")\n        return None  # Conservative fallback\n    \n    async def _external_auth_fallback(self, *args, **kwargs):\n        """Fallback for external auth operations."""\n        logger.warning("🔄 [AUTH-SYSTEM] Using external auth fallback - denying access")\n        return False  # Conservative fallback\n    \n    async def _token_validation_fallback(self, *args, **kwargs):\n        """Fallback for token validation."""\n        logger.warning("🔄 [AUTH-SYSTEM] Using token validation fallback - denying access")\n        return False  # Conservative fallback for security\n\n\n# Global authorization system instance\nauth_system = UUIDAuthorizationSystem()\n\n\n# Convenience functions for easy integration\n\nasync def authorize_generation_access(\n    user_id: str,\n    generation_id: str,\n    action: str = "read",\n    request: Optional[Request] = None\n) -> Dict[str, Any]:\n    """Convenience function to authorize generation access."""\n    return await auth_system.authorize_generation_access(user_id, generation_id, action, request)\n\n\nasync def authorize_project_access(\n    user_id: str,\n    project_id: str,\n    action: str = "read",\n    request: Optional[Request] = None\n) -> Dict[str, Any]:\n    """Convenience function to authorize project access."""\n    return await auth_system.authorize_project_access(user_id, project_id, action, request)\n\n\nasync def validate_auth_token(\n    token: str,\n    token_type: str = "access",\n    request: Optional[Request] = None\n) -> Dict[str, Any]:\n    """Convenience function to validate authentication token."""\n    return await auth_system.validate_token(token, token_type, request)\n\n\nasync def handle_auth_error(\n    error: Union[Exception, HTTPException],\n    user_id: Optional[str] = None,\n    resource_id: Optional[str] = None,\n    resource_type: Optional[str] = None,\n    request: Optional[Request] = None\n) -> JSONResponse:\n    """Convenience function to handle authorization errors."""\n    return await auth_system.handle_authorization_error(\n        error, user_id, resource_id, resource_type, request\n    )\n\n\nasync def get_auth_system_health() -> Dict[str, Any]:\n    """Get the health status of the authorization system."""\n    return await auth_system.check_system_health()\n\n\nasync def get_auth_system_metrics() -> Dict[str, Any]:\n    """Get comprehensive metrics from the authorization system."""\n    return await auth_system.get_system_metrics()\n\n\n@asynccontextmanager\nasync def auth_context(request: Optional[Request] = None):\n    """Context manager for authorization operations with automatic error handling."""\n    \n    correlation_id = str(uuid.uuid4())\n    start_time = datetime.now(timezone.utc)\n    \n    try:\n        yield auth_system\n    except Exception as e:\n        # Log the error in context\n        processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000\n        \n        logger.error(\n            f"❌ [AUTH-CONTEXT] Authorization context error: {e}",\n            extra={\n                'correlation_id': correlation_id,\n                'processing_time_ms': processing_time,\n                'error_type': type(e).__name__\n            }\n        )\n        \n        raise e
+            if isinstance(e, (UUIDAuthorizationError, ProjectAccessDeniedError)):
+                raise e
+            else:
+                auth_error = ProjectAccessDeniedError(
+                    project_id=project_id,
+                    user_id=user_id,
+                    details={'original_error': str(e), 'error_type': type(e).__name__}
+                )
+                raise auth_error
+    
+    async def validate_token(
+        self,
+        token: str,
+        token_type: str = "access",
+        request: Optional[Request] = None
+    ) -> Dict[str, Any]:
+        """Validate authentication token with comprehensive error handling."""
+        start_time = datetime.now(timezone.utc)
+        
+        try:
+            if self.config.enable_circuit_breakers:
+                validation_result = await self._authorize_with_circuit_breaker(
+                    self._perform_token_validation,
+                    token,
+                    token_type
+                )
+            else:
+                validation_result = await self._perform_token_validation(token, token_type)
+            
+            processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            
+            # Log successful validation
+            if self.config.enable_detailed_logging:
+                await log_token_validation_attempt(
+                    validation_result.get('user_id'),
+                    token_type,
+                    'valid',
+                    {'processing_time_ms': processing_time},
+                    AuthLogMetrics(processing_time_ms=processing_time)
+                )
+            
+            await self._update_system_metrics(True, processing_time)
+            
+            return validation_result
+            
+        except Exception as e:
+            processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            
+            # Log failed validation
+            if self.config.enable_detailed_logging:
+                await log_token_validation_attempt(
+                    None,
+                    token_type,
+                    'invalid',
+                    {'error': str(e), 'processing_time_ms': processing_time},
+                    AuthLogMetrics(processing_time_ms=processing_time)
+                )
+            
+            await self._update_system_metrics(False, processing_time)
+            
+            if isinstance(e, TokenValidationError):
+                raise e
+            else:
+                token_error = TokenValidationError(
+                    f"Token validation failed: {str(e)}",
+                    token_type=token_type,
+                    validation_failure_reason=str(e)
+                )
+                raise token_error
+    
+    async def handle_authorization_error(
+        self,
+        error: Union[Exception, HTTPException],
+        user_id: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        request: Optional[Request] = None
+    ) -> JSONResponse:
+        """Handle authorization errors with comprehensive error response."""
+        
+        context = AuthErrorContext(
+            user_id=user_id,
+            resource_id=resource_id,
+            resource_type=resource_type,
+            correlation_id=str(uuid.uuid4())
+        )
+        
+        if request:
+            context.client_ip = self._get_client_ip(request)
+            context.user_agent = request.headers.get('user-agent')
+            context.request_path = str(request.url.path)
+            context.request_method = request.method
+            context.request_id = getattr(request.state, 'request_id', None)
+        
+        return await self.error_handler.handle_authorization_error(
+            error, context, request
+        )
+    
+    async def check_system_health(self) -> Dict[str, Any]:
+        """Check the health of the authorization system."""
+        
+        health_status = {
+            'healthy': self.is_healthy,
+            'maintenance_mode': self.maintenance_mode,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'system_metrics': self.system_metrics.copy(),
+            'circuit_breakers': {},
+            'subsystem_health': {
+                'error_handler': True,
+                'logger': True,
+                'circuit_breakers': True,
+                'uuid_utils': True
+            }
+        }
+        
+        # Check circuit breaker health
+        if self.config.enable_circuit_breakers:
+            cb_states = self.circuit_breaker_manager.get_all_states()
+            health_status['circuit_breakers'] = cb_states
+            
+            # System is unhealthy if critical circuit breakers are open
+            critical_breakers = ['database', 'token_validation']
+            for cb_name in critical_breakers:
+                if cb_name in cb_states and cb_states[cb_name]['state'] == 'open':
+                    self.is_healthy = False
+                    health_status['healthy'] = False
+                    health_status['issues'] = health_status.get('issues', [])
+                    health_status['issues'].append(f'Critical circuit breaker {cb_name} is open')
+        
+        return health_status
+    
+    async def get_system_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive system metrics."""
+        
+        metrics = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'system_metrics': self.system_metrics.copy(),
+            'circuit_breakers': self.circuit_breaker_manager.get_all_states(),
+            'configuration': {
+                'enable_circuit_breakers': self.config.enable_circuit_breakers,
+                'enable_detailed_logging': self.config.enable_detailed_logging,
+                'enable_security_monitoring': self.config.enable_security_monitoring,
+                'enable_performance_monitoring': self.config.enable_performance_monitoring
+            }
+        }
+        
+        return metrics
+    
+    async def reset_system_state(self):
+        """Reset the authorization system to initial state."""
+        
+        logger.info("🔄 [AUTH-SYSTEM] Resetting system state")
+        
+        # Reset circuit breakers
+        if self.config.enable_circuit_breakers:
+            await self.circuit_breaker_manager.reset_all()
+        
+        # Reset system metrics
+        self.system_metrics = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'average_response_time': 0.0,
+            'error_rate': 0.0
+        }
+        
+        # Reset health status
+        self.is_healthy = True
+        self.maintenance_mode = False
+        
+        logger.info("✅ [AUTH-SYSTEM] System state reset complete")
+    
+    def _create_auth_context(
+        self,
+        user_id: str,
+        resource_id: str,
+        resource_type: str,
+        action: str,
+        request: Optional[Request]
+    ) -> AuthLogContext:
+        """Create authorization context for logging."""
+        
+        context = AuthLogContext(
+            user_id=user_id,
+            resource_id=resource_id,
+            resource_type=resource_type,
+            action=action
+        )
+        
+        if request:
+            context.client_ip = self._get_client_ip(request)
+            context.user_agent = request.headers.get('user-agent')
+            context.request_path = str(request.url.path)
+            context.request_method = request.method
+            context.session_id = getattr(request.state, 'session_id', None)
+            context.request_id = getattr(request.state, 'request_id', None)
+        
+        return context
+    
+    def _extract_request_context(self, request: Optional[Request]) -> Optional[Dict[str, Any]]:
+        """Extract request context for logging."""
+        
+        if not request:
+            return None
+        
+        return {
+            'client_ip': self._get_client_ip(request),
+            'user_agent': request.headers.get('user-agent'),
+            'request_path': str(request.url.path),
+            'request_method': request.method,
+            'session_id': getattr(request.state, 'session_id', None),
+            'request_id': getattr(request.state, 'request_id', None)
+        }
+    
+    def _get_client_ip(self, request: Request) -> str:
+        """Extract client IP from request."""
+        forwarded_for = request.headers.get('x-forwarded-for')
+        if forwarded_for:
+            return forwarded_for.split(',')[0].strip()
+        
+        real_ip = request.headers.get('x-real-ip')
+        if real_ip:
+            return real_ip
+        
+        return request.client.host if request.client else 'unknown'
+    
+    async def _authorize_with_circuit_breaker(self, func: Callable, *args, **kwargs):
+        """Execute authorization function with circuit breaker protection."""
+        
+        # Determine circuit breaker based on function
+        if func.__name__ == '_perform_token_validation':
+            cb_name = 'token_validation'
+        elif func.__name__ in ['_check_generation_ownership', '_check_project_access']:
+            cb_name = 'database'
+        else:
+            cb_name = 'external_auth'
+        
+        cb = self.circuit_breaker_manager.get_circuit_breaker(cb_name)
+        return await cb.call(func, *args, **kwargs)
+    
+    async def _check_generation_ownership(
+        self,
+        user_id: uuid.UUID,
+        generation_id: uuid.UUID,
+        action: str
+    ) -> Dict[str, Any]:
+        """Check if user owns or has access to the generation."""
+        
+        # This would implement actual database lookup
+        # For now, simulating the check
+        
+        try:
+            from database import SupabaseClient
+            db_client = SupabaseClient()
+            
+            if not db_client.is_available():
+                raise DatabaseError("Database is not available")
+            
+            # Query generation ownership
+            result = db_client.service_client.table('generations').select('user_id, created_by').eq('id', str(generation_id)).execute()
+            
+            if not result.data:
+                raise GenerationAccessDeniedError(
+                    generation_id=str(generation_id),
+                    user_id=str(user_id),
+                    details={'reason': 'Generation not found'}
+                )
+            
+            generation_data = result.data[0]
+            owner_id = generation_data.get('user_id') or generation_data.get('created_by')
+            
+            if str(owner_id) != str(user_id):
+                # Log ownership verification
+                if self.config.enable_detailed_logging:
+                    await log_ownership_verification(
+                        str(user_id),
+                        str(generation_id),
+                        'generation',
+                        str(owner_id),
+                        False
+                    )
+                
+                raise GenerationAccessDeniedError(
+                    generation_id=str(generation_id),
+                    user_id=str(user_id),
+                    owner_id=str(owner_id),
+                    details={'reason': 'Ownership check failed'}
+                )
+            
+            # Log successful ownership verification
+            if self.config.enable_detailed_logging:
+                await log_ownership_verification(
+                    str(user_id),
+                    str(generation_id),
+                    'generation',
+                    str(owner_id),
+                    True
+                )
+            
+            return {
+                'authorized': True,
+                'owner_id': str(owner_id),
+                'resource_type': 'generation',
+                'action': action
+            }
+            
+        except Exception as e:
+            if isinstance(e, GenerationAccessDeniedError):
+                raise e
+            else:
+                logger.error(f"❌ [AUTH-SYSTEM] Generation ownership check failed: {e}")
+                raise GenerationAccessDeniedError(
+                    generation_id=str(generation_id),
+                    user_id=str(user_id),
+                    details={'error': str(e), 'check_type': 'database_error'}
+                )
+    
+    async def _check_project_access(
+        self,
+        user_id: uuid.UUID,
+        project_id: uuid.UUID,
+        action: str
+    ) -> Dict[str, Any]:
+        """Check if user has access to the project."""
+        
+        try:
+            from database import SupabaseClient
+            db_client = SupabaseClient()
+            
+            if not db_client.is_available():
+                raise DatabaseError("Database is not available")
+            
+            # Check project membership or ownership
+            project_result = db_client.service_client.table('projects').select('user_id, team_id').eq('id', str(project_id)).execute()
+            
+            if not project_result.data:
+                raise ProjectAccessDeniedError(
+                    project_id=str(project_id),
+                    user_id=str(user_id),
+                    details={'reason': 'Project not found'}
+                )
+            
+            project_data = project_result.data[0]
+            project_owner = project_data.get('user_id')
+            team_id = project_data.get('team_id')
+            
+            # Check if user is project owner
+            if str(project_owner) == str(user_id):
+                return {
+                    'authorized': True,
+                    'access_type': 'owner',
+                    'project_id': str(project_id)
+                }
+            
+            # Check team membership if project has a team
+            if team_id:
+                team_result = db_client.service_client.table('team_members').select('user_id').eq('team_id', str(team_id)).eq('user_id', str(user_id)).execute()
+                
+                if team_result.data:
+                    return {
+                        'authorized': True,
+                        'access_type': 'team_member',
+                        'project_id': str(project_id),
+                        'team_id': str(team_id)
+                    }
+            
+            # No access found
+            raise ProjectAccessDeniedError(
+                project_id=str(project_id),
+                user_id=str(user_id),
+                details={'reason': 'No access permission found'}
+            )
+            
+        except Exception as e:
+            if isinstance(e, ProjectAccessDeniedError):
+                raise e
+            else:
+                logger.error(f"❌ [AUTH-SYSTEM] Project access check failed: {e}")
+                raise ProjectAccessDeniedError(
+                    project_id=str(project_id),
+                    user_id=str(user_id),
+                    details={'error': str(e), 'check_type': 'database_error'}
+                )
+    
+    async def _perform_token_validation(
+        self,
+        token: str,
+        token_type: str
+    ) -> Dict[str, Any]:
+        """Perform token validation with comprehensive error handling."""
+        
+        try:
+            # Import auth middleware for token validation
+            from middleware.auth import AuthMiddleware
+            
+            # Create temporary middleware instance for validation
+            auth_middleware = AuthMiddleware(app=None)
+            user = await auth_middleware._verify_token(token)
+            
+            return {
+                'valid': True,
+                'user_id': str(user.id),
+                'email': user.email,
+                'role': user.role,
+                'token_type': token_type
+            }
+            
+        except HTTPException as e:
+            if e.status_code == 401:
+                raise TokenValidationError(
+                    f"Token validation failed: {e.detail}",
+                    token_type=token_type,
+                    validation_failure_reason=str(e.detail)
+                )
+            else:
+                raise e
+        except Exception as e:
+            logger.error(f"❌ [AUTH-SYSTEM] Token validation error: {e}")
+            raise TokenValidationError(
+                f"Token validation failed: {str(e)}",
+                token_type=token_type,
+                validation_failure_reason=str(e)
+            )
+    
+    async def _update_system_metrics(self, success: bool, processing_time_ms: float):
+        """Update system-level metrics."""
+        
+        self.system_metrics['total_requests'] += 1
+        
+        if success:
+            self.system_metrics['successful_requests'] += 1
+        else:
+            self.system_metrics['failed_requests'] += 1
+        
+        # Update average response time
+        total_requests = self.system_metrics['total_requests']
+        current_avg = self.system_metrics['average_response_time']
+        self.system_metrics['average_response_time'] = (
+            (current_avg * (total_requests - 1) + processing_time_ms) / total_requests
+        )
+        
+        # Update error rate
+        self.system_metrics['error_rate'] = (
+            self.system_metrics['failed_requests'] / total_requests
+        ) * 100
+        
+        # Log slow operations
+        if (self.config.enable_performance_monitoring and 
+            processing_time_ms > self.config.slow_operation_threshold_ms):
+            
+            logger.warning(
+                f"🐌 [AUTH-SYSTEM] Slow authorization operation: {processing_time_ms:.2f}ms"
+            )
+    
+    # Fallback functions for circuit breakers
+    
+    async def _database_fallback(self, *args, **kwargs):
+        """Fallback for database operations."""
+        logger.warning("🔄 [AUTH-SYSTEM] Using database fallback - denying access for security")
+        return None  # Conservative fallback
+    
+    async def _external_auth_fallback(self, *args, **kwargs):
+        """Fallback for external auth operations."""
+        logger.warning("🔄 [AUTH-SYSTEM] Using external auth fallback - denying access")
+        return False  # Conservative fallback
+    
+    async def _token_validation_fallback(self, *args, **kwargs):
+        """Fallback for token validation."""
+        logger.warning("🔄 [AUTH-SYSTEM] Using token validation fallback - denying access")
+        return False  # Conservative fallback for security
+
+
+# Global authorization system instance
+auth_system = UUIDAuthorizationSystem()
+
+
+# Convenience functions for easy integration
+
+async def authorize_generation_access(
+    user_id: str,
+    generation_id: str,
+    action: str = "read",
+    request: Optional[Request] = None
+) -> Dict[str, Any]:
+    """Convenience function to authorize generation access."""
+    return await auth_system.authorize_generation_access(user_id, generation_id, action, request)
+
+
+async def authorize_project_access(
+    user_id: str,
+    project_id: str,
+    action: str = "read",
+    request: Optional[Request] = None
+) -> Dict[str, Any]:
+    """Convenience function to authorize project access."""
+    return await auth_system.authorize_project_access(user_id, project_id, action, request)
+
+
+async def validate_auth_token(
+    token: str,
+    token_type: str = "access",
+    request: Optional[Request] = None
+) -> Dict[str, Any]:
+    """Convenience function to validate authentication token."""
+    return await auth_system.validate_token(token, token_type, request)
+
+
+async def handle_auth_error(
+    error: Union[Exception, HTTPException],
+    user_id: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    request: Optional[Request] = None
+) -> JSONResponse:
+    """Convenience function to handle authorization errors."""
+    return await auth_system.handle_authorization_error(
+        error, user_id, resource_id, resource_type, request
+    )
+
+
+async def get_auth_system_health() -> Dict[str, Any]:
+    """Get the health status of the authorization system."""
+    return await auth_system.check_system_health()
+
+
+async def get_auth_system_metrics() -> Dict[str, Any]:
+    """Get comprehensive metrics from the authorization system."""
+    return await auth_system.get_system_metrics()
+
+
+@asynccontextmanager
+async def auth_context(request: Optional[Request] = None):
+    """Context manager for authorization operations with automatic error handling."""
+    
+    correlation_id = str(uuid.uuid4())
+    start_time = datetime.now(timezone.utc)
+    
+    try:
+        yield auth_system
+    except Exception as e:
+        # Log the error in context
+        processing_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        
+        logger.error(
+            f"❌ [AUTH-CONTEXT] Authorization context error: {e}",
+            extra={
+                'correlation_id': correlation_id,
+                'processing_time_ms': processing_time,
+                'error_type': type(e).__name__}
+        )
+        
+        raise e
